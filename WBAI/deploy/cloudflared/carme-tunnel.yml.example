@@ -1,0 +1,18 @@
+# Copy this file to carme-tunnel.yml after creating a named tunnel.
+# Do not put CARME_TOKEN, a tunnel token, or credential contents in this file.
+# http2 is the first protocol to verify when Karing allows TCP/7844; use quic
+# only after an explicit protocol check. Both use outbound port 7844.
+tunnel: YOUR_TUNNEL_UUID_OR_NAME
+credentials-file: /Users/YOUR_USER/.cloudflared/YOUR_TUNNEL_UUID.json
+protocol: http2
+
+ingress:
+  - hostname: carme.YOUR_DOMAIN
+    service: http://127.0.0.1:8899
+    originRequest:
+      access:
+        required: true
+        teamName: YOUR_ACCESS_TEAM_NAME
+        audTag:
+          - YOUR_ACCESS_APPLICATION_AUDIENCE_TAG
+  - service: http_status:404

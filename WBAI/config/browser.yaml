@@ -1,0 +1,102 @@
+# ============================================================
+#  浏览器代操作 —— 对应 Grok Bot 的「像真人一样操作网站」
+#  ------------------------------------------------------------
+#  为什么需要这一层：
+#    很多系统根本没有 API。要让 Bot 替你干活，只能在界面层操作。
+#    这是 Grok Bot 最难被替代的能力，也是这套方案要补的最后一环。
+#
+#  它怎么工作（和「让模型猜 CSS 选择器」的区别）：
+#    1. 把当前页面的可交互元素全部扫出来，编号成 [1] [2] [3]...
+#    2. 把编号 + 元素名称 + 类型交给模型，模型只说「点 [7]」
+#    3. 我们用编号反查真实的 DOM 节点去点
+#    模型不需要写任何选择器 —— 这是稳定性的关键。
+# ============================================================
+version: 1
+
+enabled: true
+
+# 无头模式。首次登录建议设 false，你能亲眼看着它操作、手动过验证码。
+headless: true
+
+# 默认使用哪个身份（profile）
+default_profile: default
+
+# ---------- 身份 ----------
+# 每个 profile 是一套独立的浏览器用户目录：
+# cookie、登录态、localStorage 全部隔离且持久化。
+# 登录一次，之后所有任务复用，不用反复登录。
+profiles:
+  default:
+    user_data_dir: ./data/browser/default
+    viewport: { width: 1366, height: 900 }
+    locale: zh-CN
+    timezone: Asia/Shanghai
+    # 部分站点会检测自动化特征，关掉最明显的几个
+    stealth: true
+
+  # 需要登录不同账号时，照抄一份改名即可：
+  # work:
+  #   user_data_dir: ./data/browser/work
+  #   viewport: { width: 1440, height: 900 }
+
+# ---------- 资源与安全 ----------
+safety:
+  # 同时活着的浏览器实例数。Chromium 一个就吃 200-400MB，
+  # 8GB 机器上千万别超过 1。
+  max_concurrent_browser: 1
+
+  # 闲置多久自动关掉浏览器（秒）。低配机器上这个很重要，
+  # 否则一个开着的 Chromium 会一直占着内存。
+  idle_close_seconds: 300
+
+  # 单次操作超时
+  action_timeout_ms: 20000
+  navigation_timeout_ms: 45000
+
+  # ---------- 人工确认闸门 ----------
+  # 命中下面关键词的操作会暂停，等你点头才执行。
+  # 这是「只在关键节点找你确认」的落地，也是让代操作敢用的前提。
+  require_confirmation: true
+  approval_timeout_seconds: 600
+
+  # 按钮/链接文案命中这些词 → 需要人工确认
+  dangerous_patterns:
+    - 删除
+    - 移除
+    - 注销
+    - 支付
+    - 付款
+    - 转账
+    - 提现
+    - 确认购买
+    - 提交订单
+    - 立即购买
+    - 解绑
+    - 授权
+    - 退订
+    - delete
+    - remove
+    - pay
+    - purchase
+    - checkout
+    - transfer
+    - unsubscribe
+    - authorize
+
+  # 域名白名单：留空表示不限制。
+  # 想更保险就填上你允许它访问的站点，其余一律拒绝。
+  allowed_domains: []
+
+  # 域名黑名单：命中直接拒绝，优先级高于白名单
+  blocked_domains: []
+
+  # 禁止在这些页面上做任何写操作（只允许读）
+  read_only_domains: []
+
+# ---------- 截图 ----------
+screenshots:
+  enabled: true
+  dir: ./data/screenshots
+  # 保留多少张，超出的自动删最旧的
+  keep: 100
+  full_page: false

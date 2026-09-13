@@ -1,0 +1,637 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Carme · 架构决策与选型论证</title>
+<style>
+  :root{
+    --bg:#f6f6f8; --surface:#fff; --surface2:#fafafb;
+    --line:#e6e6ea; --line2:#d6d6dc;
+    --ink:#15151a; --ink2:#4b4b56; --mut:#86868f;
+    --accent:#5b4ee6; --accent-bg:#efedfd;
+    --ok:#0f7a52; --ok-bg:#e7f6ef;
+    --warn:#9a6400; --warn-bg:#fdf4e3;
+    --err:#b8332a; --err-bg:#fcecea;
+    --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;
+    --maxw:880px;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{
+    margin:0; background:var(--bg); color:var(--ink);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
+    font-size:15.5px; line-height:1.75; -webkit-font-smoothing:antialiased;
+  }
+  .wrap{display:grid;grid-template-columns:210px minmax(0,var(--maxw));gap:44px;
+        max-width:1200px;margin:0 auto;padding:48px 28px 120px}
+  @media(max-width:900px){.wrap{grid-template-columns:1fr;gap:0;padding:28px 18px 80px}nav.toc{display:none}}
+
+  /* ---- 目录 ---- */
+  nav.toc{position:sticky;top:44px;align-self:start;font-size:13px}
+  nav.toc .t{font-size:11px;font-weight:700;letter-spacing:.09em;text-transform:uppercase;color:var(--mut);margin-bottom:10px}
+  nav.toc a{display:block;color:var(--ink2);text-decoration:none;padding:4px 0 4px 11px;
+            border-left:2px solid var(--line);line-height:1.45}
+  nav.toc a:hover{color:var(--accent);border-left-color:var(--accent)}
+  nav.toc a.sub{padding-left:22px;font-size:12.5px;color:var(--mut)}
+
+  /* ---- 头部 ---- */
+  header{margin-bottom:38px;padding-bottom:26px;border-bottom:1px solid var(--line)}
+  .kicker{font-size:12px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--accent);margin-bottom:10px}
+  h1{font-size:33px;line-height:1.22;letter-spacing:-.022em;margin:0 0 12px;font-weight:700}
+  .lede{font-size:16.5px;color:var(--ink2);margin:0;line-height:1.7}
+  .meta{margin-top:16px;font-size:12.5px;color:var(--mut);font-family:var(--mono)}
+
+  /* ---- 通用 ---- */
+  h2{font-size:22px;letter-spacing:-.015em;margin:52px 0 6px;font-weight:680;scroll-margin-top:20px}
+  h2 .n{color:var(--accent);font-family:var(--mono);font-size:16px;margin-right:9px;font-weight:600}
+  h3{font-size:16px;margin:30px 0 8px;font-weight:650;letter-spacing:-.008em}
+  h4{font-size:14px;margin:20px 0 6px;font-weight:650;color:var(--ink2)}
+  p{margin:11px 0}
+  ul,ol{margin:11px 0;padding-left:22px}
+  li{margin:5px 0}
+  code{font-family:var(--mono);font-size:.87em;background:var(--surface2);
+       border:1px solid var(--line);border-radius:5px;padding:1px 5px}
+  strong{font-weight:650}
+  a{color:var(--accent)}
+  .sub{color:var(--ink2);font-size:14.5px;margin:2px 0 14px}
+
+  /* ---- 卡片 ---- */
+  .card{background:var(--surface);border:1px solid var(--line);border-radius:14px;padding:20px 22px;margin:18px 0}
+  .card.tight{padding:15px 18px}
+  .callout{border-left:3px solid var(--accent);background:var(--accent-bg);
+           border-radius:0 12px 12px 0;padding:14px 18px;margin:18px 0}
+  .callout.warn{border-left-color:var(--warn);background:var(--warn-bg)}
+  .callout.ok{border-left-color:var(--ok);background:var(--ok-bg)}
+  .callout.err{border-left-color:var(--err);background:var(--err-bg)}
+  .callout p:first-child{margin-top:0}.callout p:last-child{margin-bottom:0}
+  .callout .h{font-weight:680;font-size:13.5px;letter-spacing:.01em;margin-bottom:4px;display:block}
+
+  /* ---- 结论块 ---- */
+  .verdict{background:var(--surface);border:1px solid var(--line2);border-radius:16px;
+           padding:24px 26px;margin:22px 0;box-shadow:0 1px 2px rgba(16,16,24,.04),0 8px 28px rgba(16,16,24,.05)}
+  .verdict .vh{font-size:12px;font-weight:700;letter-spacing:.09em;text-transform:uppercase;color:var(--accent);margin-bottom:12px}
+  .verdict ol{margin:0;padding-left:20px}
+  .verdict li{margin:9px 0}
+  .verdict li b{color:var(--ink)}
+
+  /* ---- 表格 ---- */
+  .tw{overflow-x:auto;margin:18px 0;border:1px solid var(--line);border-radius:12px;background:var(--surface)}
+  table{border-collapse:collapse;width:100%;font-size:13.5px;min-width:560px}
+  th,td{text-align:left;padding:11px 14px;border-bottom:1px solid var(--line);vertical-align:top}
+  th{background:var(--surface2);font-weight:650;font-size:12px;letter-spacing:.03em;
+     text-transform:uppercase;color:var(--ink2);white-space:nowrap}
+  tbody tr:last-child td{border-bottom:none}
+  td.c,th.c{text-align:center}
+  .yes{color:var(--ok);font-weight:700}
+  .no{color:var(--err);font-weight:700}
+  .part{color:var(--warn);font-weight:700}
+  .dim{color:var(--mut)}
+
+  /* ---- 徽标 ---- */
+  .tag{display:inline-block;font-size:11px;font-weight:650;padding:2px 8px;border-radius:99px;
+       background:var(--surface2);border:1px solid var(--line);color:var(--ink2);margin-right:5px;white-space:nowrap}
+  .tag.a{background:var(--accent-bg);border-color:#d9d4fb;color:var(--accent)}
+  .tag.ok{background:var(--ok-bg);border-color:#c6e9d9;color:var(--ok)}
+  .tag.w{background:var(--warn-bg);border-color:#f0dcb4;color:var(--warn)}
+  .tag.e{background:var(--err-bg);border-color:#f3cdc8;color:var(--err)}
+
+  /* ---- 图 ---- */
+  figure{margin:22px 0;background:var(--surface);border:1px solid var(--line);
+         border-radius:14px;padding:18px 16px 12px;overflow-x:auto}
+  figure svg{display:block;margin:0 auto;max-width:100%;height:auto}
+  figcaption{font-size:12.5px;color:var(--mut);text-align:center;margin-top:10px;padding-top:10px;border-top:1px solid var(--line)}
+
+  /* ---- 代码块 ---- */
+  pre{background:#1c1c22;color:#e8e8ee;border-radius:12px;padding:16px 18px;overflow-x:auto;
+      font-family:var(--mono);font-size:12.5px;line-height:1.65;margin:16px 0}
+  pre .c{color:#8b8b9a}
+  pre .k{color:#a99cf7}
+  pre .s{color:#8fd6a8}
+
+  /* ---- 指标 ---- */
+  .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px;margin:20px 0}
+  .stat{background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:15px 17px}
+  .stat .v{font-size:23px;font-weight:700;font-family:var(--mono);letter-spacing:-.02em}
+  .stat .l{font-size:11.5px;color:var(--mut);margin-top:3px}
+
+  /* ---- 阶段 ---- */
+  .phase{display:grid;grid-template-columns:auto 1fr;gap:16px;margin:16px 0;align-items:start}
+  .phase .num{width:34px;height:34px;border-radius:10px;background:var(--accent);color:#fff;
+              display:grid;place-items:center;font-weight:700;font-size:14px;font-family:var(--mono)}
+  .phase.done .num{background:var(--ok)}
+  .phase .body h4{margin:4px 0 4px;font-size:15px}
+  .phase .body p{margin:4px 0;font-size:14px;color:var(--ink2)}
+
+  hr{border:none;border-top:1px solid var(--line);margin:44px 0}
+  footer{margin-top:50px;padding-top:22px;border-top:1px solid var(--line);
+         font-size:12.5px;color:var(--mut)}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<nav class="toc">
+  <div class="t">目录</div>
+  <a href="#verdict">结论先行</a>
+  <a href="#gap">一、能力拆解与映射</a>
+  <a href="#limits">二、硬约束</a>
+  <a href="#choice">三、选型论证</a>
+  <a href="#arch">四、架构</a>
+  <a href="#design">五、关键设计决策</a>
+  <a href="#cost">六、成本模型</a>
+  <a href="#road">七、落地路线</a>
+  <a href="#risk">八、风险与未完成项</a>
+</nav>
+
+<main>
+
+<header>
+  <div class="kicker">架构决策文档</div>
+  <h1>Carme：用一台闲置 MacBook 复刻 Grok Bot</h1>
+  <p class="lede">把「常驻 AI 员工团队」从别人的云上搬回自己家里 —— 可行性、选型、架构、成本与路线。</p>
+  <div class="meta">2026-09-11　·　目标硬件 MacBook Pro 13" 2018（8GB / 可常驻）　·　开发机 MacBook Pro M1 Pro</div>
+</header>
+
+<!-- ══════════════════ 结论 ══════════════════ -->
+<h2 id="verdict"><span class="n">00</span>结论先行</h2>
+
+<div class="verdict">
+  <div class="vh">三句话结论</div>
+  <ol>
+    <li><b>能替代，而且替代品已经建好并在跑。</b>项目代号 Carme，本机已验证：派活 → 主控拆解 → 派给成员 → 沙箱执行 → 回报 → 汇总，整条链路通。</li>
+    <li><b>瓶颈不是算力，是内存。</b>8GB 机器做不了本地模型推理 —— 但这恰好不重要，因为推理本来就该走云端 API。它真正的价值是<b>「24 小时在线」+「一个隔离的执行环境」</b>。</li>
+    <li><b>两条路，先想清楚你要哪个。</b>想要开箱即用、生态成熟，装 OpenClaw；想要极轻、完全可控、按自己的形状长，用 Carme。两条路都能把 Grok Bot 替掉。</li>
+  </ol>
+</div>
+
+<div class="stats">
+  <div class="stat"><div class="v">8 GB</div><div class="l">目标机内存 · 硬上限</div></div>
+  <div class="stat"><div class="v">1</div><div class="l">沙箱并发 · 必须锁死</div></div>
+  <div class="stat"><div class="v">3</div><div class="l">任务并发 · 安全值</div></div>
+  <div class="stat"><div class="v">¥0</div><div class="l">固定月费 · 只付 API</div></div>
+</div>
+
+<!-- ══════════════════ 一 ══════════════════ -->
+<h2 id="gap"><span class="n">01</span>能力拆解与映射</h2>
+<p class="sub">先把你说的「体验很好」拆成可验收的条目，再逐条回答自建怎么等价实现、差在哪。</p>
+
+<div class="tw">
+<table>
+<thead>
+<tr><th>Grok Bot 的能力</th><th>自建怎么等价实现</th><th class="c">达成度</th><th>差距说明</th></tr>
+</thead>
+<tbody>
+<tr>
+  <td><b>多 Bot 各司其职</b><br><span class="dim">自建销售/招聘/费用 Bot</span></td>
+  <td><code>config/agents.yaml</code> 里每个成员一段：人设 prompt + 工具白名单 + 模型档位 + 执行环境。纯文本，可版本管理</td>
+  <td class="c"><span class="yes">完全</span></td>
+  <td>配置化，比 Grok Bot 的界面表单更灵活；代价是要手写 YAML</td>
+</tr>
+<tr>
+  <td><b>主 Bot 指挥其他 Bot</b><br><span class="dim">管理 Bot 汇总子 Bot 进展</span></td>
+  <td>主控持有 <code>delegate</code> 工具，一次回复里可以并发发起多个派发，成员结果回来后再汇总</td>
+  <td class="c"><span class="yes">完全</span></td>
+  <td>比 Grok Bot 多一层可控性：硬性递归深度上限、子任务失败明确回报</td>
+</tr>
+<tr>
+  <td><b>Bot 间自主通信</b><br><span class="dim">协商分工、传递任务</span></td>
+  <td>走主控中转（星型拓扑），不开放成员直连</td>
+  <td class="c"><span class="part">部分</span></td>
+  <td><b>有意为之的差距。</b>网状通信在低配机上是失控风险源；星型拓扑链路可读、可审计、好排错</td>
+</tr>
+<tr>
+  <td><b>独立 Linux 主机</b><br><span class="dim">每个 Bot 一台云计算机</span></td>
+  <td>可插拔执行层：<code>local</code>（本机受限目录）/ <code>docker</code>（容器隔离）/ <code>remote</code>（SSH 到闲置机）。按角色分配</td>
+  <td class="c"><span class="yes">完全</span></td>
+  <td>比「每人一台」更省资源：一台机器按需分时复用，8GB 也扛得住</td>
+</tr>
+<tr>
+  <td><b>在主机上跑程序</b></td>
+  <td><code>shell</code> 工具在沙箱内执行，带超时、输出截断、危险命令拦截</td>
+  <td class="c"><span class="yes">完全</span></td>
+  <td>—</td>
+</tr>
+<tr>
+  <td><b>浏览器搜资料</b></td>
+  <td><code>web_search</code>（DuckDuckGo / SearxNG / Tavily）+ <code>fetch_page</code>（可选浏览器渲染）</td>
+  <td class="c"><span class="yes">完全</span></td>
+  <td>检索本身没难度，难点在抓取质量与反爬，需要持续调</td>
+</tr>
+<tr>
+  <td><b>手机端 + 桌面端</b></td>
+  <td>自建 PWA：响应式布局，手机浏览器「添加到主屏幕」即得 App 图标；桌面浏览器直接开</td>
+  <td class="c"><span class="yes">完全</span></td>
+  <td>体验不如原生 App 顺滑，但完全自主可控、随时能改</td>
+</tr>
+<tr>
+  <td><b>工作流录制与演化</b><br><span class="dim">看你操作一遍就学会</span></td>
+  <td>暂未实现</td>
+  <td class="c"><span class="no">未做</span></td>
+  <td>这是 Grok Bot 最被低估的能力。技术上要用 Playwright 录制 + 步骤抽象，属于下一阶段</td>
+</tr>
+<tr>
+  <td><b>账号代操作</b><br><span class="dim">像真人一样点网页，无需 API</span></td>
+  <td>部分：<code>fetch_page(render=true)</code> 能渲染 JS 页面，但没有「登录 → 点按 → 填表」的完整闭环</td>
+  <td class="c"><span class="part">部分</span></td>
+  <td>这是 Grok Bot 的<b>杀手锏</b>，也是自建最难补的一块。见下方专段</td>
+</tr>
+<tr>
+  <td><b>24 小时云端常驻</b></td>
+  <td>把服务装到那台常驻机上，配 launchd 开机自启 + 改电源策略防止睡死</td>
+  <td class="c"><span class="yes">完全</span></td>
+  <td>前提是你得有一台愿意长期插电的机器 —— 这正是那台 2018 的价值所在</td>
+</tr>
+</tbody>
+</table>
+</div>
+
+<h3>唯一真正的硬骨头：账号代操作</h3>
+<p>Grok Bot 最值钱的地方，是它<b>不依赖 API</b>：直接登录你的账号，在界面层点击、填写、推进任务。这让它能操作那些永远不会有 API 的老系统 —— Salesforce 后台、招聘网站、内部报销系统。</p>
+<p>自建方案里这块要自己补，技术栈是现成的：<b>Playwright</b> 已经预留在依赖里。缺的是三件事：</p>
+<ul>
+  <li><b>凭证保管</b>：登录态得加密存本地，且不能让模型直接看到密码（否则一次提示注入就泄露）。</li>
+  <li><b>选择器稳定性</b>：网站改版就会挂。要么用视觉定位（多模态模型看截图点坐标），要么用可访问性树而非 CSS 选择器。</li>
+  <li><b>人在环审批</b>：涉及付款、发送、提交这类不可逆动作，必须停下来等确认。</li>
+</ul>
+<div class="callout warn">
+  <span class="h">关于「用账号密码代登录」的风险</span>
+  <p>这件事的收益很大，风险同样大。建议分两步走：先只做<b>只读类</b>代操作（抓数据、查状态），把不可逆动作全部留给人工确认。等链路稳了再逐步放开写操作。</p>
+</div>
+
+<!-- ══════════════════ 二 ══════════════════ -->
+<h2 id="limits"><span class="n">02</span>硬约束：那台 2018 的真实边界</h2>
+<p class="sub">方案必须从硬件的真实数字长出来，而不是从愿望长出来。</p>
+
+<h3>硬件事实</h3>
+<div class="tw">
+<table>
+<thead><tr><th>项目</th><th>实际情况</th><th>后果</th></tr></thead>
+<tbody>
+<tr><td>CPU</td><td>Intel 双核 i5（2018 款 13" 低配）</td><td>跑脚本够用，跑模型完全不行</td></tr>
+<tr><td>内存</td><td><b>8 GB</b>（板载，不可升级）</td><td>这是整个方案的<b>唯一真瓶颈</b></td></tr>
+<tr><td>GPU</td><td>Intel Iris Plus 集成显卡</td><td>无加速能力，本地推理彻底排除</td></tr>
+<tr><td>存储</td><td>128–256 GB SSD</td><td>够用；镜像和工作目录要定期清</td></tr>
+<tr><td>系统上限</td><td><b>macOS 15 Sequoia</b>（Tahoe 26 已不支持 2018 款）</td><td>不影响运行 —— Carme 只要求 Python 3.11+</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="callout">
+  <span class="h">为什么「不能跑本地模型」不是问题</span>
+  <p>很多人一想到自建 Agent 就想到本地跑大模型。在 8GB 机器上这条路是死的（7B 模型要 8GB 内存，加上系统直接爆）。<br>
+  但反过来想：<b>Agent 的瓶颈从来不是推理，而是工具调用和状态管理</b>。推理交给云端 API，一次调用几分钱；本机只负责调度、沙箱、界面 —— 这些加起来内存占用不到 1GB。</p>
+  <p>而且云端 API 恰好解决了你原本的核心痛点：<b>模型可换、额度不限</b>。本地跑模型反而是把新的锁定换了个形式。</p>
+</div>
+
+<h3>三条必须遵守的资源纪律</h3>
+<ol>
+  <li><b>沙箱并发锁死为 1。</b>一个容器 + 一个 Chromium 就能吃掉 1.5–2GB。同时开两个，8GB 机器开始疯狂 swap，整机卡到没法用。</li>
+  <li><b>任务并发可以放宽到 3。</b>因为 LLM 调用是纯 I/O 等待，几乎不占本机资源。这个「任务并发 ≠ 沙箱并发」的区分是整个设计里最关键的一刀。</li>
+  <li><b>容器内存上限 2GB。</b><code>colima start --cpu 2 --memory 4</code>，容器内再限 2GB，给宿主留足余量。</li>
+</ol>
+
+<!-- ══════════════════ 三 ══════════════════ -->
+<h2 id="choice"><span class="n">03</span>选型论证</h2>
+<p class="sub">2026 年这个赛道已经有成熟方案了，自建不是唯一解。诚实地摆出来比。</p>
+
+<div class="tw">
+<table>
+<thead>
+<tr><th>方案</th><th>形态</th><th class="c">多 Bot<br>角色</th><th class="c">主控<br>调度</th><th class="c">沙箱/<br>执行机</th><th class="c">手机端</th><th class="c">资源<br>占用</th><th>适合谁</th></tr>
+</thead>
+<tbody>
+<tr>
+  <td><b>Grok Bot</b><br><span class="dim">xAI 官方</span></td>
+  <td>云端 SaaS</td>
+  <td class="c"><span class="yes">✓</span></td>
+  <td class="c"><span class="yes">✓</span></td>
+  <td class="c"><span class="yes">每人一台</span></td>
+  <td class="c"><span class="yes">原生 App</span></td>
+  <td class="c">—</td>
+  <td>不想折腾、愿意付 $120–300/月的人。<b>你已经被额度卡住了</b></td>
+</tr>
+<tr style="background:var(--accent-bg)">
+  <td><b>Carme</b><br><span class="dim">本项目</span></td>
+  <td>自托管 · Python</td>
+  <td class="c"><span class="yes">✓</span></td>
+  <td class="c"><span class="yes">✓</span></td>
+  <td class="c"><span class="yes">可插拔</span></td>
+  <td class="c"><span class="yes">PWA</span></td>
+  <td class="c"><span class="yes">极轻</span></td>
+  <td>要完全可控、按自己形状长、能读能改每一行代码的人</td>
+</tr>
+<tr>
+  <td><b>OpenClaw</b><br><span class="dim">社区最热，38 万 star</span></td>
+  <td>自托管 · Node</td>
+  <td class="c"><span class="yes">✓ 隔离式</span></td>
+  <td class="c"><span class="part">半</span></td>
+  <td class="c"><span class="yes">Docker</span></td>
+  <td class="c"><span class="yes">20+ 渠道</span></td>
+  <td class="c"><span class="part">中等</span></td>
+  <td>想要开箱即用、生态成熟、不介意 Node 全家桶的人</td>
+</tr>
+<tr>
+  <td><b>Dify / n8n</b></td>
+  <td>自托管 · 工作流</td>
+  <td class="c"><span class="part">工作流式</span></td>
+  <td class="c"><span class="no">✗</span></td>
+  <td class="c"><span class="part">弱</span></td>
+  <td class="c"><span class="yes">Web</span></td>
+  <td class="c"><span class="no">重</span></td>
+  <td>流程自动化，不是「AI 员工」。跑在 8GB 上很吃力</td>
+</tr>
+<tr>
+  <td><b>CrewAI / LangGraph</b></td>
+  <td>开发框架</td>
+  <td class="c"><span class="yes">✓</span></td>
+  <td class="c"><span class="yes">✓</span></td>
+  <td class="c"><span class="no">需自建</span></td>
+  <td class="c"><span class="no">需自建</span></td>
+  <td class="c">轻</td>
+  <td>写给开发者的库，没有成品界面和沙箱，要自己搭一大半</td>
+</tr>
+</tbody>
+</table>
+</div>
+
+<h3>为什么最终选「自建 Carme」</h3>
+<ol>
+  <li><b>OpenClaw 是强对手，但它不是为 8GB 机器设计的。</b>它是 Node 全家桶 + pnpm workspace，Docker 沙箱，本体就不轻。更要紧的是它的多 Agent 是<b>扁平隔离式</b>（多个独立 agent 靠渠道绑定路由），官方文档明确说没有「主 Agent 指挥子 Agent」的层级机制 —— 而「一个主 Bot 带队」恰好是你的核心诉求。</li>
+  <li><b>你的诉求很集中。</b>多角色 + 主控调度 + 一台执行机 + 手机端。不需要 20 个聊天渠道、不需要插件市场、不需要 MCP 全生态。为这些通用能力付出的资源代价，在 8GB 机器上是纯负担。</li>
+  <li><b>可控性就是可靠性。</b>整个引擎不到 4000 行 Python，模型网关、Agent 循环、沙箱、调度全是你自己能读懂改动的代码。出问题时不用猜框架里发生了什么。</li>
+  <li><b>两条路不互斥。</b>如果哪天想要 OpenClaw 的生态，Carme 的 <code>agents.yaml</code> 角色定义可以直接翻译过去；反过来也一样。不用现在就赌死。</li>
+</ol>
+
+<div class="callout ok">
+  <span class="h">什么情况下我建议你改用 OpenClaw</span>
+  <p>如果你发现：想要接微信/飞书/WhatsApp 这些现成渠道、想要社区插件市场、或者不想维护自己的代码 —— 那 OpenClaw 是更划算的选择。它的成熟度确实更高。<br>
+  <b>自建的价值只在「你愿意并且能够维护它」时才成立。</b></p>
+</div>
+
+<!-- ══════════════════ 四 ══════════════════ -->
+<h2 id="arch"><span class="n">04</span>架构</h2>
+
+<figure>
+<svg viewBox="0 0 820 560" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,BlinkMacSystemFont,PingFang SC,sans-serif">
+  <defs>
+    <marker id="ar" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+      <path d="M0,0 L7,3 L0,6 z" fill="#86868f"/>
+    </marker>
+    <marker id="ar2" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+      <path d="M0,0 L7,3 L0,6 z" fill="#5b4ee6"/>
+    </marker>
+  </defs>
+
+  <!-- 用户层 -->
+  <rect x="300" y="16" width="220" height="46" rx="10" fill="#efedfd" stroke="#c9c2f8"/>
+  <text x="410" y="38" text-anchor="middle" font-size="13.5" font-weight="650" fill="#15151a">你 · 手机 PWA / 桌面浏览器</text>
+  <text x="410" y="53" text-anchor="middle" font-size="11" fill="#6b6b76">派活 · 看进度 · 审批</text>
+
+  <line x1="410" y1="62" x2="410" y2="92" stroke="#5b4ee6" stroke-width="1.6" marker-end="url(#ar2)"/>
+  <text x="422" y="82" font-size="10.5" fill="#5b4ee6" font-family="ui-monospace,monospace">HTTP + SSE</text>
+
+  <!-- 服务层 -->
+  <rect x="60" y="94" width="700" height="188" rx="14" fill="#fff" stroke="#d6d6dc"/>
+  <text x="78" y="116" font-size="11.5" font-weight="700" fill="#86868f" letter-spacing="1.1">CARME 服务进程</text>
+
+  <!-- API -->
+  <rect x="80" y="128" width="150" height="52" rx="9" fill="#fafafb" stroke="#e6e6ea"/>
+  <text x="155" y="150" text-anchor="middle" font-size="12.5" font-weight="600" fill="#15151a">API 层</text>
+  <text x="155" y="167" text-anchor="middle" font-size="10.5" fill="#6b6b76">REST + SSE 事件流</text>
+
+  <!-- runtime -->
+  <rect x="248" y="128" width="200" height="52" rx="9" fill="#fafafb" stroke="#e6e6ea"/>
+  <text x="348" y="150" text-anchor="middle" font-size="12.5" font-weight="600" fill="#15151a">Runtime 调度器</text>
+  <text x="348" y="167" text-anchor="middle" font-size="10.5" fill="#6b6b76">并发闸门 · 派发 · 取消 · 预算</text>
+
+  <!-- store -->
+  <rect x="466" y="128" width="130" height="52" rx="9" fill="#fafafb" stroke="#e6e6ea"/>
+  <text x="531" y="150" text-anchor="middle" font-size="12.5" font-weight="600" fill="#15151a">SQLite</text>
+  <text x="531" y="167" text-anchor="middle" font-size="10.5" fill="#6b6b76">任务 · 消息 · 记忆</text>
+
+  <!-- llm -->
+  <rect x="614" y="128" width="128" height="52" rx="9" fill="#fafafb" stroke="#e6e6ea"/>
+  <text x="678" y="150" text-anchor="middle" font-size="12.5" font-weight="600" fill="#15151a">模型网关</text>
+  <text x="678" y="167" text-anchor="middle" font-size="10.5" fill="#6b6b76">降级 · 计费</text>
+
+  <line x1="230" y1="154" x2="246" y2="154" stroke="#86868f" stroke-width="1.4" marker-end="url(#ar)"/>
+  <line x1="448" y1="154" x2="464" y2="154" stroke="#86868f" stroke-width="1.4" marker-end="url(#ar)"/>
+  <line x1="596" y1="154" x2="612" y2="154" stroke="#86868f" stroke-width="1.4" marker-end="url(#ar)"/>
+
+  <!-- agents -->
+  <rect x="80" y="196" width="662" height="70" rx="9" fill="#fafafb" stroke="#e6e6ea" stroke-dasharray="4 3"/>
+  <text x="98" y="216" font-size="11" font-weight="650" fill="#86868f">成员 Bot（每个 = 人设 + 工具白名单 + 模型档位 + 执行环境）</text>
+
+  <rect x="98" y="226" width="118" height="30" rx="7" fill="#efedfd" stroke="#c9c2f8"/>
+  <text x="157" y="245" text-anchor="middle" font-size="11.5" font-weight="650" fill="#5b4ee6">🎯 主控 chief</text>
+  <rect x="226" y="226" width="118" height="30" rx="7" fill="#fff" stroke="#e6e6ea"/>
+  <text x="285" y="245" text-anchor="middle" font-size="11.5" fill="#15151a">🔍 情报员</text>
+  <rect x="354" y="226" width="118" height="30" rx="7" fill="#fff" stroke="#e6e6ea"/>
+  <text x="413" y="245" text-anchor="middle" font-size="11.5" fill="#15151a">🔧 工程师</text>
+  <rect x="482" y="226" width="118" height="30" rx="7" fill="#fff" stroke="#e6e6ea"/>
+  <text x="541" y="245" text-anchor="middle" font-size="11.5" fill="#15151a">✍️ 运营</text>
+  <rect x="610" y="226" width="118" height="30" rx="7" fill="#fff" stroke="#e6e6ea"/>
+  <text x="669" y="245" text-anchor="middle" font-size="11.5" fill="#15151a">🧪 审校官</text>
+
+  <path d="M157,226 L157,216 L669,216 L669,226" fill="none" stroke="#5b4ee6" stroke-width="1.3" stroke-dasharray="3 2"/>
+  <text x="420" y="211" text-anchor="middle" font-size="10" fill="#5b4ee6" font-family="ui-monospace,monospace">delegate（可并行派发，星型拓扑）</text>
+
+  <line x1="410" y1="282" x2="410" y2="312" stroke="#86868f" stroke-width="1.4" marker-end="url(#ar)"/>
+
+  <!-- 沙箱层 -->
+  <rect x="60" y="314" width="700" height="96" rx="14" fill="#fff" stroke="#d6d6dc"/>
+  <text x="78" y="336" font-size="11.5" font-weight="700" fill="#86868f" letter-spacing="1.1">执行层 · 可插拔（沙箱并发 = 1）</text>
+
+  <rect x="80" y="348" width="200" height="46" rx="9" fill="#fafafb" stroke="#e6e6ea"/>
+  <text x="180" y="367" text-anchor="middle" font-size="12" font-weight="600" fill="#15151a">local · 本机受限目录</text>
+  <text x="180" y="383" text-anchor="middle" font-size="10.5" fill="#6b6b76">零依赖，不是安全边界</text>
+
+  <rect x="300" y="348" width="200" height="46" rx="9" fill="#fafafb" stroke="#e6e6ea"/>
+  <text x="400" y="367" text-anchor="middle" font-size="12" font-weight="600" fill="#15151a">docker · 容器隔离</text>
+  <text x="400" y="383" text-anchor="middle" font-size="10.5" fill="#6b6b76">2GB / 2CPU 上限</text>
+
+  <rect x="520" y="348" width="222" height="46" rx="9" fill="#e7f6ef" stroke="#c6e9d9"/>
+  <text x="631" y="367" text-anchor="middle" font-size="12" font-weight="600" fill="#0f7a52">remote · SSH 到闲置机</text>
+  <text x="631" y="383" text-anchor="middle" font-size="10.5" fill="#6b6b76">没开机自动降级到 local</text>
+
+  <line x1="410" y1="410" x2="410" y2="440" stroke="#86868f" stroke-width="1.4" marker-end="url(#ar)"/>
+
+  <!-- 外部 -->
+  <rect x="60" y="442" width="330" height="58" rx="12" fill="#fff" stroke="#d6d6dc"/>
+  <text x="225" y="464" text-anchor="middle" font-size="12.5" font-weight="600" fill="#15151a">模型供应商（云端 API）</text>
+  <text x="225" y="482" text-anchor="middle" font-size="10.5" fill="#6b6b76">Anthropic · OpenAI · DeepSeek · Kimi · 通义 · GLM · OpenRouter</text>
+
+  <rect x="410" y="442" width="332" height="58" rx="12" fill="#fff" stroke="#d6d6dc"/>
+  <text x="576" y="464" text-anchor="middle" font-size="12.5" font-weight="600" fill="#15151a">那台 2018 款 MacBook Pro</text>
+  <text x="576" y="482" text-anchor="middle" font-size="10.5" fill="#6b6b76">8GB · 常驻 · 隔离的执行环境</text>
+
+  <!-- 图例 -->
+  <text x="60" y="530" font-size="10.5" fill="#86868f">关键：任务并发（3）与沙箱并发（1）分开限流 —— LLM 调用不吃本机资源，沙箱才吃。</text>
+</svg>
+<figcaption>Carme 分层架构。星型拓扑 + 可插拔执行层是这套设计的两根支柱。</figcaption>
+</figure>
+
+<h3>数据流：一次派活的完整生命周期</h3>
+<ol>
+  <li><b>你</b>在 PWA 里输入「调研三家竞品定价，做张对比表」，默认交给主控。</li>
+  <li><b>API 层</b>建任务记录 → 投给 Runtime → 立刻返回 task_id（不阻塞你的界面）。</li>
+  <li><b>主控</b>用最强模型档位拆解目标，在一次回复里并发发起两个 <code>delegate</code>：情报员去查资料，工程师准备表格脚本。</li>
+  <li><b>每个成员</b>在自己的循环里调工具。需要执行时向沙箱层申请槽位 —— 因为并发是 1，两个成员会排队，但这是刻意的（8GB 的物理限制）。</li>
+  <li><b>成员结果</b>回传给主控，主控汇总成一份交付。过程中所有事件通过 SSE 实时推到你的界面。</li>
+  <li><b>你</b>在任务详情里看到完整链路：每一步工具调用、每一条命令的真实输出、每个子任务的成本。</li>
+</ol>
+
+<!-- ══════════════════ 五 ══════════════════ -->
+<h2 id="design"><span class="n">05</span>关键设计决策</h2>
+<p class="sub">这几个决定，是「能在 8GB 上跑」和「跑不动」的分水岭。</p>
+
+<div class="card">
+  <h3>① 角色绑「档位」，不绑具体模型</h3>
+  <p><code>agents.yaml</code> 里写 <code>tier: reason</code>；<code>models.yaml</code> 里 <code>reason</code> 档位挂一串候选模型，按顺序降级。第一个挂了自动换下一个。</p>
+  <p><b>这是对「模型锁定」最直接的回答。</b>想换模型只改一处，所有 Bot 立刻跟着换。而且日常检索类任务用便宜档位、只有拆解和汇总用最强档位 —— 成本能压到 Grok Bot 的零头。</p>
+</div>
+
+<div class="card">
+  <h3>② 沙箱按需占用，等下属时主动让出</h3>
+  <p>一个真实会踩的坑：主控占着唯一的沙箱槽位 → 派活给工程师 → 工程师也要抢这个槽位 → 主控等工程师、工程师等槽位 → <b>死锁</b>。</p>
+  <p>解法是把「占用」和「持有」拆开：真要跑命令时才申请槽位，等待下属执行期间主动释放。在只有 1 个沙箱槽位的机器上，这是让多层协作能跑起来的关键。</p>
+</div>
+
+<div class="card">
+  <h3>③ 任务并发与沙箱并发分开限流</h3>
+  <p>LLM 调用是纯 I/O 等待，开 3 个几乎不占本机资源；真正吃内存的是沙箱（一个容器 + Chromium ≈ 1.5–2GB）。</p>
+  <p>所以：<b>任务并发 3，沙箱并发 1</b>。如果笼统地「限制并发 = 1」，整个团队就退化成单线程，失去了「多 Bot 并行」的意义。</p>
+</div>
+
+<div class="card">
+  <h3>④ 派发是同步等待，不是消息队列</h3>
+  <p>主控调用 <code>delegate</code> 时会一直等到子任务结束。好处是推理链路线性、可读、出错好定位；代价是子任务失败必须返回明确的失败文本，而不是让主控干等。</p>
+  <p>换来的是：任务详情里你能看到一棵完整的调用树，每个节点都有成本、耗时、真实输出。<b>可观测性比理论上的吞吐量重要得多。</b></p>
+</div>
+
+<div class="card">
+  <h3>⑤ 前端不用构建工具</h3>
+  <p>原生 ES 模块 + 手写 CSS，没有 npm install、没有 webpack。理由很实际：目标机器只有 8GB，多一个 <code>node_modules</code> 就多一份负担；而且你随时能打开源文件改两行。</p>
+  <p>手机端通过 PWA 实现 —— Safari 里「添加到主屏幕」就得到一个 App 图标，全屏运行，无需 App Store。</p>
+</div>
+
+<!-- ══════════════════ 六 ══════════════════ -->
+<h2 id="cost"><span class="n">06</span>成本模型</h2>
+<p class="sub">你选了「已有 API key，按量走」。下面是不同用量下的真实量级。</p>
+
+<div class="tw">
+<table>
+<thead>
+<tr><th>方案</th><th class="c">固定月费</th><th class="c">额度</th><th class="c">模型选择</th><th>备注</th></tr>
+</thead>
+<tbody>
+<tr>
+  <td>Grok Bot · Cursor Teams Premium</td>
+  <td class="c"><b>$120</b></td><td class="c"><span class="no">有周额度</span></td><td class="c"><span class="no">仅 Grok</span></td>
+  <td>约 ¥860/月，<b>你当前的困境</b></td>
+</tr>
+<tr>
+  <td>Grok Bot · SuperGrok Heavy</td>
+  <td class="c"><b>$300</b></td><td class="c"><span class="no">有周额度</span></td><td class="c"><span class="no">仅 Grok</span></td>
+  <td>约 ¥2160/月</td>
+</tr>
+<tr style="background:var(--accent-bg)">
+  <td><b>Carme · 轻量用法</b></td>
+  <td class="c"><b>¥0</b></td><td class="c"><span class="yes">无</span></td><td class="c"><span class="yes">任意</span></td>
+  <td>日常跑 DeepSeek/Qwen，约 <b>¥20–80/月</b> API 费</td>
+</tr>
+<tr style="background:var(--accent-bg)">
+  <td><b>Carme · 主力用法</b></td>
+  <td class="c"><b>¥0</b></td><td class="c"><span class="yes">无</span></td><td class="c"><span class="yes">任意</span></td>
+  <td>混合档位，关键任务上好模型，约 <b>¥150–400/月</b></td>
+</tr>
+</tbody>
+</table>
+</div>
+
+<div class="callout ok">
+  <span class="h">省钱的真正杠杆是档位路由</span>
+  <p>一次「调研 + 写报告」的任务里，90% 的 token 花在检索、抽取、格式转换上 —— 这些用便宜档位（DeepSeek / Qwen / GLM）完全够。
+  只有主控的拆解和最终汇总值得上最强档位。<br>
+  <b>配好档位路由，成本大约是「全程用最强模型」的 1/5 到 1/10。</b></p>
+</div>
+
+<p>另外附送一个 Grok Bot 给不了的东西：<b>每一分钱花在哪，界面上一清二楚</b>。按 Bot、按模型、按任务都有明细，还能设日预算熔断（<code>models.yaml</code> 里的 <code>budget.daily_usd</code>），花超了直接拒绝新任务。</p>
+
+<!-- ══════════════════ 七 ══════════════════ -->
+<h2 id="road"><span class="n">07</span>落地路线</h2>
+
+<div class="phase done">
+  <div class="num">✓</div>
+  <div class="body">
+    <h4>阶段一 · 引擎跑通（已完成）</h4>
+    <p>多 Bot 角色体系、主控派发、Agent 工具循环、可插拔沙箱、SQLite 持久化、REST + SSE、PWA 界面、部署脚本、假模型链路验证。全部在本机验证通过。</p>
+  </div>
+</div>
+
+<div class="phase">
+  <div class="num">2</div>
+  <div class="body">
+    <h4>阶段二 · 接上真实模型，日常用起来</h4>
+    <p>填 <code>.env</code> 里的 API key → 跑 <code>models probe</code> 看真实可用型号 → 调 <code>models.yaml</code> 的档位 → 把 <code>allow_mock</code> 改成 <code>false</code>。</p>
+    <p>先用它跑几天真实任务，观察三件事：哪些角色配得不对、哪些工具不够用、成本落在什么量级。<b>这一步的目的是让配置从「我猜的」变成「我用出来的」。</b></p>
+  </div>
+</div>
+
+<div class="phase">
+  <div class="num">3</div>
+  <div class="body">
+    <h4>阶段三 · 搬上那台 2018，变成真·常驻</h4>
+    <p>在闲置机上跑 <code>deploy/carme-node-setup.sh --docker</code>（自动改电源策略、装容器运行时），然后二选一：</p>
+    <p><b>形态 A（推荐）</b>：整套装在 2018 上，沙箱用 <code>local</code>。它插着电就一直干活，不依赖你在不在电脑前。<br>
+    <b>形态 B</b>：Carme 留在 M1，2018 配成 <code>remote</code> 节点，重活丢给它。</p>
+    <p>再配 <code>deploy/install.sh --service</code> 注册开机自启，加上局域网访问，手机就随时能派活。</p>
+  </div>
+</div>
+
+<div class="phase">
+  <div class="num">4</div>
+  <div class="body">
+    <h4>阶段四 · 补上 Grok Bot 的杀手锏</h4>
+    <p><b>账号代操作</b>：基于 Playwright 加一个 computer-use 工具，实现「登录 → 点按 → 填表 → 提交」。建议先做只读类，写操作一律留人工确认。</p>
+    <p><b>工作流录制</b>：录下你的操作序列，抽象成可复用模板，Bot 照着执行并随纠正优化。</p>
+    <p><b>定时任务</b>：让它每天早上自己拉数据、出简报，推到你手机上。</p>
+  </div>
+</div>
+
+<!-- ══════════════════ 八 ══════════════════ -->
+<h2 id="risk"><span class="n">08</span>风险与未完成项</h2>
+<p class="sub">诚实列清楚，免得踩空。</p>
+
+<div class="tw">
+<table>
+<thead><tr><th>项目</th><th class="c">状态</th><th>说明与应对</th></tr></thead>
+<tbody>
+<tr><td>账号代操作（无 API 操作网站）</td><td class="c"><span class="tag e">未做</span></td><td>Grok Bot 的杀手锏。Playwright 已预留，但要自己实现登录态保管与选择器策略。见阶段四</td></tr>
+<tr><td>工作流录制与演化</td><td class="c"><span class="tag e">未做</span></td><td>技术上可行（Playwright 录制 + 步骤抽象），但工作量不小</td></tr>
+<tr><td>Bot 间网状通信</td><td class="c"><span class="tag w">有意不做</span></td><td>星型拓扑在低配机上是更稳的选择 —— 网状通信会让并发数失控。需要时把成员也设成 <code>can_delegate: true</code> 即可，但建议先跑一段时间再开</td></tr>
+<tr><td>多节点动态负载均衡</td><td class="c"><span class="tag w">未做</span></td><td>目前按角色静态分配执行环境，不是动态调度</td></tr>
+<tr><td>用户体系与权限</td><td class="c"><span class="tag w">极简</span></td><td>只有一个 token，适合个人或小团队自用。别直接暴露到公网</td></tr>
+<tr><td>提示注入</td><td class="c"><span class="tag e">行业未解</span></td><td>Bot 会读网页，网页里可能藏指令。<b>应对：工具权限按最小必要原则配</b>（这就是为什么审校官只能读不能写），别给 Bot 配比你愿意交出去的权限更高的密钥</td></tr>
+<tr><td>8GB 内存上限</td><td class="c"><span class="tag w">物理约束</span></td><td>沙箱并发只能是 1，任务会排队。这是物理事实，不是配置问题</td></tr>
+<tr><td>那台机器是笔记本</td><td class="c"><span class="tag w">需处理</span></td><td>合盖/断电就中断。节点脚本会改电源策略，但必须<b>插着电</b></td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="callout">
+  <span class="h">最后一个判断</span>
+  <p>这套方案最大的风险不是技术，是<b>维护意愿</b>。自建意味着你拥有了全部的灵活性和全部的责任 —— 模型换版本、网站改结构、机器出故障，都得你自己处理。</p>
+  <p>如果你要的是「装上就不管了」，Grok Bot 或者 OpenClaw 更合适。如果你要的是「它按我的形状长，我随时能改」，那 Carme 这条路是对的 —— 而且现在已经能跑了。</p>
+</div>
+
+<footer>
+  Carme · 架构决策文档 · 2026-09-11<br>
+  模型型号会变，代码里的默认值只是起点 —— 用 <code>carme models probe</code> 问你的 key 要真实答案。
+</footer>
+
+</main>
+</div>
+</body>
+</html>

@@ -1,0 +1,140 @@
+# ============================================================
+#  模型路由 —— 这一层就是为了干掉 Grok Bot 的「模型锁定 + 额度墙」
+#  ------------------------------------------------------------
+#  设计思路：
+#    角色不直接绑模型，而是绑「档位(tier)」。档位下面挂一串候选模型，
+#    按顺序尝试，前一个挂了/超额了就自动降级到下一个。
+#    想换模型？改这一个文件，所有 bot 立刻跟着换。
+#
+#  模型 id 写法： <provider>/<model>
+#  不确定你手上的 key 支持哪些型号，跑： carme models probe
+#  它会直接问各家的 /models 接口，把真实可用的型号列出来。
+# ============================================================
+version: 1
+
+# ---------- 供应商 ----------
+providers:
+
+  anthropic:
+    type: anthropic                              # 原生 /v1/messages 协议
+    base_url: https://api.anthropic.com
+    api_key_env: ANTHROPIC_API_KEY
+
+  openai:
+    type: openai                                 # OpenAI 兼容 /chat/completions
+    base_url: https://api.openai.com/v1
+    api_key_env: OPENAI_API_KEY
+
+  deepseek:
+    type: openai
+    base_url: https://api.deepseek.com/v1
+    api_key_env: DEEPSEEK_API_KEY
+
+  moonshot:                                      # Kimi
+    type: openai
+    base_url: https://api.moonshot.cn/v1
+    api_key_env: MOONSHOT_API_KEY
+
+  dashscope:                                     # 通义千问
+    type: openai
+    base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+    api_key_env: DASHSCOPE_API_KEY
+
+  zhipu:                                         # 智谱 GLM
+    type: openai
+    base_url: https://open.bigmodel.cn/api/paas/v4
+    api_key_env: ZHIPU_API_KEY
+
+  openrouter:                                    # 一个 key 打通所有模型
+    type: openai
+    base_url: https://openrouter.ai/api/v1
+    api_key_env: OPENROUTER_API_KEY
+
+  ollama:                                        # 本地模型（8GB 机器上意义不大，留着备用）
+    type: openai
+    base_url: http://127.0.0.1:11434/v1
+    api_key_env: OLLAMA_API_KEY                  # 随便填个非空值
+    api_key_default: ollama
+    local: true                                  # 本地服务，不计入「可用供应商」统计
+
+  mock:                                          # 假模型：验证链路用，不联网不花钱
+    type: mock
+    base_url: ""                                 # 不走网络
+    api_key_env: MOCK_API_KEY
+    api_key_default: mock                        # 永远可用，方便开箱验证
+    local: true
+
+# ---------- 模型清单（用于成本统计，单价：美元 / 百万 token）----------
+# 单价按你实际拿到的价格改；没登记的模型按 0 计费，不影响使用。
+models:
+  - id: anthropic/claude-opus-4-6
+    in: 15.0
+    out: 75.0
+  - id: anthropic/claude-sonnet-4-6
+    in: 3.0
+    out: 15.0
+  - id: anthropic/claude-haiku-4-6
+    in: 0.8
+    out: 4.0
+  - id: openai/gpt-5
+    in: 1.25
+    out: 10.0
+  - id: openai/gpt-5-mini
+    in: 0.25
+    out: 2.0
+  - id: deepseek/deepseek-chat
+    in: 0.27
+    out: 1.10
+  - id: deepseek/deepseek-reasoner
+    in: 0.55
+    out: 2.19
+  - id: moonshot/kimi-k2-turbo-preview
+    in: 0.60
+    out: 2.50
+  - id: dashscope/qwen3-max
+    in: 1.20
+    out: 6.00
+  - id: zhipu/glm-4.6
+    in: 0.60
+    out: 2.20
+
+# ---------- 档位：角色绑这个，不绑具体型号 ----------
+# candidates 按顺序降级，第一个失败的自动换下一个。
+# 每个档位末尾都挂了 mock/mock：在你还没配任何 API key 时，
+# 它保证整条链路仍然可跑，方便先验证架构再花钱。
+# 正式用起来后把 allow_mock 改成 false，它就会被自动剔除。
+allow_mock: true
+
+tiers:
+
+  # 最强推理：拆解复杂目标、写关键代码、做最终汇总
+  reason:
+    candidates:
+      - anthropic/claude-opus-4-6
+      - openai/gpt-5
+      - deepseek/deepseek-reasoner
+      - openrouter/anthropic/claude-opus-4-6
+      - mock/mock
+
+  # 均衡：日常写作、审校、中等难度推理
+  balanced:
+    candidates:
+      - anthropic/claude-sonnet-4-6
+      - openai/gpt-5
+      - moonshot/kimi-k2-turbo-preview
+      - deepseek/deepseek-chat
+      - mock/mock
+
+  # 快而省：检索、抽取、分类、格式转换这类量大活
+  fast:
+    candidates:
+      - deepseek/deepseek-chat
+      - openai/gpt-5-mini
+      - dashscope/qwen3-max
+      - zhipu/glm-4.6
+      - mock/mock
+
+# ---------- 预算熔断 ----------
+budget:
+  daily_usd: 0            # 0 = 不限制；填数字则当日花费超限后拒绝新任务
+  warn_at_ratio: 0.8      # 到 80% 在界面告警

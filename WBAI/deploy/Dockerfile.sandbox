@@ -1,0 +1,47 @@
+# 沙箱镜像：给 Agent 一个「可以随便折腾」的 Linux 环境
+#
+# 为什么用 Linux 而不是复用 macOS：
+#   1. Agent 装依赖、跑脚本会污染环境，容器里脏了直接删掉重建；
+#   2. 绝大多数教程和依赖都假设 Linux，命中率更高；
+#   3. 这就是 Grok Bot 里「每个 Bot 一台独立小机器」的等价物。
+#
+# 构建：
+#   docker build -f deploy/Dockerfile.sandbox -t carme/sandbox:latest .
+#
+# 在 2018 款那台机器上，建议先用 colima 起一个 4G 的虚拟机：
+#   brew install colima docker
+#   colima start --cpu 2 --memory 4 --disk 30
+
+FROM python:3.12-slim
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    LANG=C.UTF-8 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+
+# 常用命令行工具 + 中文字体（生成图表/PDF 时不至于全是方块）
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git curl wget jq ripgrep fd-find less vim-tiny \
+        build-essential pkg-config \
+        sqlite3 \
+        ca-certificates \
+        fonts-noto-cjk \
+    && rm -rf /var/lib/apt/lists/*
+
+# Agent 干活最常用的 Python 库，预装省得每次都 pip install
+RUN pip install --no-cache-dir \
+        requests httpx \
+        pandas numpy \
+        matplotlib \
+        openpyxl \
+        beautifulsoup4 lxml \
+        python-dateutil pytz
+
+# 非 root 用户跑，降低越权风险
+RUN useradd -m -u 1000 -s /bin/bash worker
+WORKDIR /workspace
+RUN mkdir -p /workspace && chown -R worker:worker /workspace
+
+USER worker
+
+CMD ["sleep", "infinity"]
