@@ -1,0 +1,16 @@
+{
+  "home": "/absolute/path/to/Carme",
+  "instance_id": "carme-main",
+  "control_url": "http://127.0.0.1:8900",
+  "key_file": "/absolute/path/to/Carme/runtime/secrets/broker-key",
+  "docker_binary": "/absolute/path/to/docker",
+  "docker_config": "/absolute/path/to/dedicated-docker-config",
+  "docker_context": "explicit-context-name",
+  "images": {"pi": "REPLACE_WITH_VERIFIED_SHA256", "action": "REPLACE_WITH_VERIFIED_SHA256"},
+  "targets": ["pi-action"],
+  "max_pi": 2,
+  "max_seconds": 600,
+  "max_output_bytes": 65536,
+  "cpus": 1,
+  "memory": "768m"
+}

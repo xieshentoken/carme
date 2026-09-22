@@ -1,0 +1,26 @@
+# Candidate only. Broker runs separately on the host and owns Docker management.
+# Set CARME_HOME and the verified CONTROL_IMAGE digest; never mount the parent home.
+services:
+  control:
+    image: ${CONTROL_IMAGE:?verified image digest required}
+    pull_policy: never
+    user: '1000:1000'
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ['no-new-privileges:true']
+    pids_limit: 128
+    mem_limit: 768m
+    cpus: 1
+    ports: ['127.0.0.1:${CARME_PORT:-8900}:8899']
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=64m,mode=1777
+      - /runtime:rw,nosuid,nodev,size=128m,uid=1000,gid=1000,mode=700
+    volumes:
+      - ${CARME_HOME:?}/config:/config
+      - ${CARME_HOME:?}/runtime/control:/control-state
+      - ${CARME_HOME:?}/runtime/artifacts:/artifacts
+      - ${CARME_HOME:?}/runtime/skills:/skills:ro
+      - ${CARME_HOME:?}/runtime/secrets/control-token:/run/secrets/control-token:ro
+      - ${CARME_HOME:?}/runtime/secrets/broker-key:/run/secrets/broker-key:ro
+      # Mount each explicitly configured dedicated provider key separately.
+    restart: 'no'

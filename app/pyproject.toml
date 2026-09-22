@@ -1,0 +1,33 @@
+[project]
+name = "carme"
+version = "0.2.0"
+description = "自托管的常驻 AI 员工团队 —— Grok Bot 的自建替代品"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "httpx>=0.27",
+    "pydantic>=2.9",
+    "pyyaml>=6.0",
+    "python-dotenv>=1.0",
+    "pillow>=11.0",
+    "pypdf>=6.0",
+]
+
+[project.optional-dependencies]
+# 浏览器工具需要；不装则 browser 工具自动降级为纯 HTTP 抓取
+browser = ["playwright>=1.48"]
+# 在 Mac 上跑容器沙箱需要（brew install colima docker）
+docker = ["docker>=7.1"]
+# 本机 macOS 桌面截图与 Quartz 鼠标控制；Mac 专属依赖不进入基础安装
+desktop = ["pyobjc-framework-Quartz>=10.3", "pyobjc-framework-ApplicationServices>=10.3"]
+
+[project.scripts]
+carme = "carme.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["carme*"]

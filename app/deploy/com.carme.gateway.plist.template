@@ -1,0 +1,71 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Carme 常驻服务（macOS launchd）
+
+  install.sh 的 service 模式会自动把这份模板里的占位符替换掉，
+  然后装到 ~/Library/LaunchAgents/com.carme.gateway.plist。
+
+  手动管理：
+    launchctl load   ~/Library/LaunchAgents/com.carme.gateway.plist
+    launchctl unload ~/Library/LaunchAgents/com.carme.gateway.plist
+    launchctl list | grep carme
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.carme.gateway</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>__PROJECT_DIR__/.venv/bin/python</string>
+    <string>-m</string>
+    <string>uvicorn</string>
+    <string>carme.app:app</string>
+    <string>--host</string>
+    <string>0.0.0.0</string>
+    <string>--port</string>
+    <string>8787</string>
+    <string>--timeout-graceful-shutdown</string>
+    <string>5</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>__PROJECT_DIR__</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>CARME_LOG_LEVEL</key>
+    <string>INFO</string>
+    <!-- 这层代理会让本机回环请求走不通，显式排除 -->
+    <key>NO_PROXY</key>
+    <string>*</string>
+    <key>no_proxy</key>
+    <string>*</string>
+  </dict>
+
+  <!-- 崩溃自动重启；睡眠时不强杀（合盖也能继续跑）-->
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>__PROJECT_DIR__/data/carme.log</string>
+  <key>StandardErrorPath</key>
+  <string>__PROJECT_DIR__/data/carme.error.log</string>
+
+  <!-- 低优先级，别跟用户抢资源 -->
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>Nice</key>
+  <integer>5</integer>
+</dict>
+</plist>

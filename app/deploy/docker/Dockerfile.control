@@ -1,0 +1,21 @@
+FROM node:22.22.2-bookworm-slim@sha256:9f6d5975c7dca860947d3915877f85607946403fc55349f39b4bc3688448bb6e AS frontend
+WORKDIR /build
+COPY web/package.json web/package-lock.json ./
+RUN npm ci --no-audit --no-fund
+COPY web/ ./
+RUN npm run build
+
+FROM python:3.13.12-slim-bookworm@sha256:a58daefb915e1e03ad48f3ca4df8832065412c5c35cacb9d39f4229184de12b6
+COPY deploy/docker/requirements-control.lock /tmp/requirements.lock
+RUN pip install --no-cache-dir --require-hashes -r /tmp/requirements.lock && rm /tmp/requirements.lock \
+    && useradd --uid 1000 --create-home control
+WORKDIR /app
+COPY carme/ ./carme/
+COPY --from=frontend /build/dist ./web/dist/
+COPY deploy/docker/control-entrypoint.py /app/control-entrypoint.py
+ENV HOME=/runtime/home TMPDIR=/runtime PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 \
+    CARME_BIND_HOST=0.0.0.0 CARME_CONFIG_DIR=/config CARME_DATA_DIR=/control-state \
+    CARME_ENV_FILE=/config/.env CARME_ARTIFACTS_DIR=/artifacts CARME_SKILLS_DIR=/skills
+USER 1000:1000
+EXPOSE 8899
+ENTRYPOINT ["python", "/app/control-entrypoint.py"]

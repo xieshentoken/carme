@@ -1,0 +1,38 @@
+**
+!carme/
+!carme/**
+!web/
+!web/src/
+!web/src/**
+!web/public/
+!web/public/**
+!web/package.json
+!web/package-lock.json
+!web/index.html
+!web/*.png
+!web/*.webmanifest
+!web/sw.js
+!web/tsconfig*.json
+!web/vite.config.*
+!deploy/
+!deploy/docker/
+!deploy/docker/**
+**/__pycache__/**
+**/*.pyc
+**/.env*
+**/auth.json
+**/*.db
+**/*.db-wal
+**/*.db-shm
+**/node_modules/**
+**/.pi/**
+**/.ssh/**
+**/browser-profile/**
+**/Cookies
+**/Cookies-journal
+**/History
+**/History-journal
+**/Login Data*
+**/Web Data*
+**/Local State
+**/*.sqlite*

@@ -1,0 +1,32 @@
+# Official browser binaries and OS libraries, pinned independently of Carme code.
+FROM mcr.microsoft.com/playwright/python:v1.63.0-noble@sha256:72bd171a9ffc2b4b59532aaa6210e21014d07093120dc25528870c0b840da1f0
+COPY deploy/docker/requirements-control.lock deploy/docker/requirements-browser.lock /tmp/
+RUN python -m pip install --target /opt/browser --no-cache-dir --require-hashes \
+    -r /tmp/requirements-control.lock -r /tmp/requirements-browser.lock \
+    && rm /tmp/requirements-*.lock
+# Google Chrome 正式版（可选 channel: chrome 用）。Google 源只有 amd64 包；arm64 构建跳过，
+# 那种镜像里 channel: chrome 会在启动时报"找不到 Chrome"，不影响默认 Chromium。
+ARG TARGETARCH=""
+USER root
+RUN if [ "$TARGETARCH" = "amd64" ]; then \
+      apt-get update \
+      && apt-get install -y --no-install-recommends wget gpg ca-certificates \
+      && wget -qO- https://dl.google.com/linux/linux_signing_key.pub \
+         | gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg \
+      && echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] http://dl.google.com/linux/chrome/deb/ stable main" \
+         > /etc/apt/sources.list.d/google-chrome.list \
+      && apt-get update \
+      && apt-get install -y --no-install-recommends google-chrome-stable \
+      && apt-get purge -y wget gpg \
+      && apt-get autoremove -y \
+      && rm -rf /var/lib/apt/lists/* ; \
+    fi
+USER 1000:1000
+WORKDIR /app
+COPY carme/__init__.py carme/engines.py carme/security.py carme/worker.py carme/docker_browser.py carme/approval.py carme/store.py ./carme/
+COPY carme/browser/ ./carme/browser/
+COPY carme/tools/__init__.py carme/tools/base.py carme/tools/web.py carme/tools/browser.py ./carme/tools/
+COPY deploy/docker/worker-entrypoint.py ./worker-entrypoint.py
+ENV HOME=/runtime/home TMPDIR=/runtime PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 CARME_LOAD_ENV=0 PYTHONPATH=/opt/browser
+USER 1000:1000
+ENTRYPOINT ["python", "/app/worker-entrypoint.py"]

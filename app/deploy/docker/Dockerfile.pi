@@ -1,0 +1,15 @@
+FROM node:22.22.2-bookworm-slim@sha256:9f6d5975c7dca860947d3915877f85607946403fc55349f39b4bc3688448bb6e AS node
+WORKDIR /opt/pi
+COPY deploy/docker/package.json deploy/docker/package-lock.json ./
+RUN npm ci --ignore-scripts --no-audit --no-fund
+
+FROM python:3.13.12-slim-bookworm@sha256:a58daefb915e1e03ad48f3ca4df8832065412c5c35cacb9d39f4229184de12b6
+COPY --from=node /usr/local/bin/node /usr/local/bin/node
+COPY --from=node /opt/pi /opt/pi
+RUN useradd --uid 1000 --no-create-home worker
+WORKDIR /app
+COPY carme/__init__.py carme/engines.py carme/security.py carme/worker.py ./carme/
+COPY deploy/docker/worker-entrypoint.py /app/worker-entrypoint.py
+ENV HOME=/runtime TMPDIR=/runtime PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PI_SKIP_VERSION_CHECK=1
+USER 1000:1000
+ENTRYPOINT ["python", "/app/worker-entrypoint.py"]

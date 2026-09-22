@@ -1,0 +1,34 @@
+# Candidate configuration only: copy into the candidate config/isolation.yaml after review.
+# Does not activate Pi, install credentials, or authorize host directories.
+version: 1
+broker:
+  instance_id: carme-main
+  key_file: /run/secrets/broker-key
+  max_pi: 2
+admin_tools: [memory, skill, browser, files, exec, team, mcp, read_attachment, create_artifact]
+targets:
+  pi-action:
+    tools: [files, exec, read_attachment, create_artifact]
+    image_digest: ''  # Verified Action image ID; never latest or a task-supplied image.
+credentials:
+  carme-pi-api:
+    protocol: openai-completions
+    base_url: https://api.example.invalid/v1
+    models: []  # Exact provider/model allowlist matching the profile below.
+    key_file: /run/secrets/carme-pi-api
+profiles:
+  pi-managed-v1:
+    engine: pi
+    package_name: '@earendil-works/pi-coding-agent'
+    package_version: '0.85.1'
+    # Supply the verified Pi image ID. Empty remains fail-closed.
+    image_digest: ''
+    execution_mode: managed_bridge
+    inherit_user_config: false
+    native_tools: []
+    session_authority: carme
+    resume_personal_sessions: false
+    credential_kind: api_key
+    # Dedicated Carme identity reference, never a personal ~/.pi path or a raw key.
+    credential_ref: carme-pi-api
+    model: ''  # Explicit provider/model required; no discovery from personal defaults.
