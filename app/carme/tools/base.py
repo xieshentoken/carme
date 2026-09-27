@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import abc
 import logging
+import time
 from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
@@ -52,13 +53,19 @@ TOOL_GROUPS: dict[str, list[str]] = {
         "web_close",
     ],
     "exec": ["shell"],
+    "desktop": ["bot_computer"],
     "team": ["delegate", "list_agents"],
-    # 技能：读「探索 Bot → 已安装的 Skill」里装好的 SKILL.md
-    "skill": ["list_skills", "use_skill"],
+    # 技能：读取授权版本；只在自己的 Linux 内可自主安装/删除。
+    "skill": ["list_skills", "use_skill", "install_skill", "remove_skill"],
     # MCP：展开成「当前已连上的外部 MCP Server 的全部工具」，
     # 具体内容随连接状态变化，由 ToolRegistry 的动态分组在运行时算。
     "mcp": [],
 }
+
+
+# Shared by policy construction and the last tool-dispatch check.
+COMMON_CONTEXT_TOOLS = frozenset({'shell', 'read_file', 'write_file', 'list_files', 'read_attachment',
+                                  'create_artifact', 'verify_artifact', 'web_search', 'fetch_page', 'delegate', 'list_agents'})
 
 
 @dataclass
@@ -84,6 +91,13 @@ class ToolContext:
     # 由运行时注入：向界面推一条即时状态
     emit: Callable[[str, dict], Awaitable[None]] | None = None
     extras: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def local_autonomy(self) -> bool:
+        """Runtime-bound permission, never a model-supplied tool argument."""
+        policy = self.extras.get('policy', {})
+        return (policy.get('local_autonomy') is True and policy.get('target') == 'container'
+                and policy.get('computer_target') == 'linux')
 
     async def notify(self, type_: str, payload: dict | None = None) -> None:
         if self.emit is not None:
@@ -204,13 +218,25 @@ class ToolRegistry:
         tool = self._tools.get(name)
         if tool is None:
             return f"[工具错误] 不存在名为 {name!r} 的工具。可用：{', '.join(self.names())}"
+        operation = None
+        skill_change = name in {'install_skill', 'remove_skill'}
+        if skill_change:
+            ctx.extras['skill_change_started'] = False
         try:
             policy = ctx.extras["policy"] if "policy" in ctx.extras else {"tools": self.expand(ctx.agent.tools), "max_tool_calls": 32}
             if name in {"shell", "read_file", "write_file", "list_files"} and ctx.sandbox_handle is None:
                 return "[权限拒绝] target_unassigned"
+            if ctx.store and ctx.store.task_context(ctx.task_id)['context_mode'] == 'visitor_group':
+                if (policy.get('context_mode') != 'visitor_group' or policy.get('target') != 'container'
+                        or policy.get('context_epoch') != ctx.store.context_epoch(ctx.task_id)
+                        or name not in COMMON_CONTEXT_TOOLS):
+                    return '[权限拒绝] common_capability_denied'
             if name not in policy.get("tools", []):
                 return "[权限拒绝] capability_denied"
-            if set(arguments) & {"task_id", "agent_id", "bot_id", "run_id", "node", "execution_target", "policy"}:
+            identity_keys = {"task_id", "agent_id", "bot_id", "run_id", "node", "execution_target", "policy"}
+            if name == "share_attachment":
+                identity_keys.remove("bot_id")  # Required receiver; Store still binds the sender to ctx.task_id.
+            if set(arguments) & identity_keys:
                 return "[权限拒绝] identity_override_denied"
             check = ctx.extras.get("check_policy")
             if check:
@@ -218,19 +244,24 @@ class ToolRegistry:
             calls = ctx.extras.get("tool_calls", 0)
             if calls >= policy.get("max_tool_calls", 32):
                 return "[权限拒绝] tool_call_limit_exceeded"
+            deadline = ctx.extras.get('deadline')
+            if deadline and deadline - time.time() <= 45:
+                return '[任务即将截止] 本轮不再启动新工具调用。请用已有回执和资料给出结论，说明未完成部分。'
             ctx.extras["tool_calls"] = calls + 1
             if ctx.store:ctx.store.claim_tool_budget(ctx.task_id)
             arguments = deepcopy(arguments)
             ctx.extras["call"] = {"name": name, "arguments": arguments}
             operation=None
-            if ctx.store and (name.startswith('mcp__') or name in {'delegate','mac_action','web_click','web_type','web_press','web_login'}
+            if ctx.store and (name.startswith('mcp__') or name in {'delegate','mac_action','bot_computer','web_click','web_type','web_press','web_login','install_skill','remove_skill'}
                               or (policy.get('target')=='ssh' and name in {'shell','write_file'})):
                 from ..security import digest
                 # Stable call ordinal is checkpointed, so a resumed call finds its receipt.
                 ordinal=ctx.extras.get('operation_ordinal',0)+1
                 ctx.extras['operation_ordinal']=ordinal
                 operation=ctx.store.operation_begin(ctx.task_id,name,digest({'name':name,'args':arguments,
-                    'permission':policy.get('permission_version'),'ordinal':ordinal}))
+                    # Skill grants legitimately change this task's permission version. The
+                    # task/call ordinal remains stable across recovery; policy was checked above.
+                    'permission':None if name in {'install_skill','remove_skill'} else policy.get('permission_version'),'ordinal':ordinal}))
                 if operation['status']=='finished':return operation['result']
                 if operation['status']!='new':raise ValueError('external_effect_reconciliation_required')
             from ..docker_browser import WEB_TOOLS
@@ -241,6 +272,8 @@ class ToolRegistry:
                 result = await execution.browser_tool(ctx, name, arguments)
             else:
                 result = await tool.run(ctx, **arguments)
+            if ctx.store:
+                ctx.store.task_context(ctx.task_id)
             if operation:
                 ctx.store.operation_finish(operation['id'],result,receipt={'tool':name,'ordinal':ordinal,
                     'permission_version':policy.get('permission_version')})
@@ -251,10 +284,21 @@ class ToolRegistry:
                 return encoded[:limit].decode("utf-8", errors="ignore") + "\n[output_limit_exceeded]"
             return result
         except TypeError as exc:
-            return f"[工具参数错误] {name} 的参数不匹配：{exc}"
+            desktop_no_effect = False
+            result = f"[工具参数错误] {name} 的参数不匹配：{exc}"
         except Exception as exc:  # noqa: BLE001 - 工具异常要变成模型能读的文本，而不是崩掉整个任务
             log.exception("工具 %s 执行失败", name)
-            return f"[工具异常] {name} 执行失败：{type(exc).__name__}: {exc}"
+            result = f"[工具异常] {name} 执行失败：{type(exc).__name__}: {exc}"
+            from ..docker_desktop import DesktopNoEffectError, DESKTOP_READ_ONLY_OPS
+            desktop_no_effect = (name == 'bot_computer' and isinstance(arguments, dict) and
+                (arguments.get('operation') in DESKTOP_READ_ONLY_OPS or
+                 (arguments.get('operation') == 'fetch' and isinstance(exc, DesktopNoEffectError))))
+        if operation and operation['status'] == 'new' and (desktop_no_effect or
+                (skill_change and not ctx.extras.get('skill_change_started'))):
+            # A failed download, validation or approval check never changed a grant.
+            # Record that fact so recovery does not demand external reconciliation.
+            ctx.store.operation_finish(operation['id'], result, receipt={'tool': name, 'effect': 'not_performed'})
+        return result
 
 
 def build_registry(skills: "SkillManager | None" = None, mcp: "MCPManager | None" = None) -> ToolRegistry:
@@ -269,7 +313,7 @@ def build_registry(skills: "SkillManager | None" = None, mcp: "MCPManager | None
                         VerifyArtifactTool, ShareAttachmentTool)
     from .memory import ForgetTool, RecallTool, RememberTool
     from .shell import ShellTool
-    from .skill import ListSkillsTool, UseSkillTool, ProposeSkillTool
+    from .skill import ListSkillsTool, UseSkillTool, ProposeSkillTool, InstallSkillTool, RemoveSkillTool
     from .web import WEB_TOOLS
 
     registry = ToolRegistry({"mcp": (mcp.tool_names if mcp is not None else (lambda: []))})
@@ -296,4 +340,6 @@ def build_registry(skills: "SkillManager | None" = None, mcp: "MCPManager | None
         registry.register(ListSkillsTool(skills))
         registry.register(UseSkillTool(skills))
         registry.register(ProposeSkillTool(skills))
+        registry.register(InstallSkillTool(skills))
+        registry.register(RemoveSkillTool(skills))
     return registry

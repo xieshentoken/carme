@@ -136,7 +136,7 @@ def create_app() -> FastAPI:
 
         @app.get("/", include_in_schema=False)
         async def index_missing() -> JSONResponse:
-            return JSONResponse({"detail": "网页尚未构建，请在 WBAI/web 执行 npm ci 和 npm run build。API 已可用。"}, status_code=503)
+            return JSONResponse({"detail": "网页尚未构建，请在 app/web 执行 npm ci 和 npm run build。API 已可用。"}, status_code=503)
 
     return app
 

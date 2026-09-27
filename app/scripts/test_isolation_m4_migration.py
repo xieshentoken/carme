@@ -15,7 +15,7 @@ def module(name,path):
 legacy_path=Path(sys.argv[1]).resolve();output=Path(sys.argv[2]).resolve()
 legacy=module('pre_m4_store',legacy_path)
 cli=module('m4_launcher',Path(__file__).with_name('carme_docker.py'))
-root=Path(tempfile.mkdtemp(prefix='carme-m4-migration-',dir='/private/tmp'));base=root/'accounts/synthetic'
+root=Path(tempfile.mkdtemp(prefix='carme-m4-migration-',dir=tempfile.gettempdir()));base=root/'accounts/synthetic'
 for path in ('config','runtime/control','runtime/skills','runtime/artifacts'): (base/path).mkdir(parents=True)
 (base/'config/fixture.json').write_text('{"synthetic":true}')
 (base/'runtime/skills/legacy.txt').write_text('original installed skill')

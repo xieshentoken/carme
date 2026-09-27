@@ -8,7 +8,7 @@ COPY --from=node /usr/local/bin/node /usr/local/bin/node
 COPY --from=node /opt/pi /opt/pi
 RUN useradd --uid 1000 --no-create-home worker
 WORKDIR /app
-COPY carme/__init__.py carme/engines.py carme/security.py carme/worker.py ./carme/
+COPY carme/__init__.py carme/engines.py carme/security.py carme/worker.py carme/pi_session.mjs ./carme/
 COPY deploy/docker/worker-entrypoint.py /app/worker-entrypoint.py
 ENV HOME=/runtime TMPDIR=/runtime PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PI_SKIP_VERSION_CHECK=1
 USER 1000:1000

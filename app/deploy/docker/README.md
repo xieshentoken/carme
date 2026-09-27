@@ -1,4 +1,31 @@
-# M2 容器候选部署
+# Carme 容器部署
+
+## 账号电脑与 main 宿主授权（2026-09-22）
+
+当前启动器为每个账号创建固定容量的独立磁盘镜像。安装 Chrome 前实际可用空间为 **2 GiB（2,147,483,648 字节）**；Chrome for Testing 153.0.8010.52 的 Linux arm64 官方包、浏览器资料、Bot 文件、安装的软件与新任务工作区均占用此额度。桌面基础镜像由 Docker 共用；账号数据库、原始附件与模型凭据继续保存在原账号目录，不占此电脑磁盘额度。
+
+- `storage/account.sparseimage`：固定容量 HFS+ 镜像，启动器负责挂载；磁盘缺失、未挂载或身份不符直接失败，不回退无容量限制的目录。
+- `storage/mount/bots/<bot>/`：Bot 的独立家目录与 Chrome profile。每个 Bot 只挂载自己的目录。
+- `storage/mount/apps/`：同账号共享软件，只读挂入所有 Bot。通过 `bot_computer publish` 发布不可覆盖的版本；拒绝链接及路径越界。
+- `storage/mount/runs/<bot>/<task>/`：任务工作区与经过授权的输入。桌面以只读 `/task-files` 访问该 Bot 的任务输入。
+
+每个 Bot 的桌面包含 X11、窗口管理器、文件管理器、编辑器、终端和 Chrome；默认最多同时运行 2 个桌面，闲置 120 秒后关闭，文件和浏览器资料保留。旧账号升级会保留原浏览器目录，并复制到新磁盘；原本未指定执行目标的 Bot 绑定独立容器，已有显式目标保留。
+
+`bot_computer` 调用固定版本 `@injaneity/pi-computer-use@0.5.1` 的真实 UI 工具，同时提供下载、容器 Shell、软件发布与列表操作。启动器显式安装并授权 Carme 管理的 `pi-computer-use` Skill。Bot 可下载源码或便携 Linux 软件，在自己的目录编译安装，再发布给同账号其他 Bot；macOS 二进制不能直接变成 Linux 软件，移植仍取决于源码、依赖和架构。
+
+Worker 保持非 root、只读系统盘、无 Docker socket、`network=none`。浏览器及 `fetch` 使用既有审核后的公网 HTTP 通道；软件本身不获得任意网络或 root `apt` 权限。单次下载上限 512 MiB；需联网的包管理器应先下载依赖，再离线安装。用户上传的安装包沿用附件大小和授权限制。
+
+在 **Bot 的电脑 → 管理** 中选择 Bot。开启 **外部控制** 后可使用鼠标、键盘或手机触控板操作，期间 Bot 的 UI 操作暂停；关闭、换 Bot、页面离开或租约到期会释放控制。手机单指拖移移动鼠标，长按后拖动可拖拽。控制令牌只属于当前页面，不放入 URL。
+
+### main 连接宿主 Mac
+
+只为 `main` 准备此能力，默认关闭；其他账号不能取得宿主授权。进入本机后台的 **main → 本机电脑**，完成系统权限、启动 Runner 后，在 **main 的宿主电脑** 中勾选确认并授权。Bot ID 留空授权 main 全部 Bot，也可填一个 Bot；授权最长 600 秒，可随时撤销。
+
+授权期间电脑组件显示本机 Mac，`bot_computer` 使用本机固定版本的 `pi-computer-use.app`。复用匹配版本的现有 App，以私有 socket 和独立 GUI 桥接进程运行；不加载个人 Pi 模型、凭据或扩展，不提供宿主 Shell。系统权限按钮只发起 macOS 授权请求，由用户在系统界面决定。Bot 操作仍沿用任务审批。
+
+宿主是同一块真实桌面，全部获授权 Bot 共用一把控制锁。执行中的人工接管、授权到期、撤销或 Runner 断开都会停止旧操作；不会把旧动作重新发送到 Linux。切换授权会更新任务权限版本，需发起新任务。撤销后组件切回该 Bot 原来的独立 Linux 桌面。
+
+升级前保存账号配置及对应 `running-release.json`，停止空闲账号再执行启动器 `--restart`。回滚时停止账号，恢复配套配置并用保存的旧 release 调用 `start`；保留新磁盘和旧浏览器目录，不混用新版授权配置与旧镜像。下方 M2/M3 文档保留历史阶段背景，涉及存储和桌面的当前行为以本节为准。
 
 ## 统一入口与账号密码（2026-09-20）
 
@@ -68,7 +95,7 @@ Gateway 校验 Cloudflare JWT 的 RS256 签名、issuer、audience 和有效期�
 
 新增专项测试：`runtime/docker/toolchains/gateway/bin/python -B app/scripts/test_gateway.py`。覆盖双重认证、密码、CSRF、会话撤销、改密、限流、跨账号路由和存储。真实页面验收使用两个临时 Docker 账号，不调用真实模型；真实 Docker Chromium 另行验证账号 Cookie 隔离及同账号持久化。
 
-本轮通过：18 项认证专项测试、24 项实际页面/聊天/附件/SSE 检查、8 项首次改密页面检查、14 项 Docker Chromium 检查，以及既有 M1 20 项、Cloudflare 6 项、Service Worker 9 项回归。页面尺寸为 1440×1000 和 390×844，未出现前端运行时异常或横向溢出。测试证据保存在本机 `/private/tmp/carme-gateway-*`；受限环境最初阻止 Chromium/进程归属检查，最终浏览器验收在获准的隔离测试进程内完成。公网双重登录、旧数据迁移与 iPhone 真机仍未验收，不能将本机通过等同于已上线。
+本轮通过：18 项认证专项测试、24 项实际页面/聊天/附件/SSE 检查、8 项首次改密页面检查、14 项 Docker Chromium 检查，以及既有 M1 20 项、Cloudflare 6 项、Service Worker 9 项回归。页面尺寸为 1440×1000 和 390×844，未出现前端运行时异常或横向溢出。测试证据保存在本机临时目录 `carme-gateway-*`；受限环境最初阻止 Chromium/进程归属检查，最终浏览器验收在获准的隔离测试进程内完成。公网双重登录、旧数据迁移与 iPhone 真机仍未验收，不能将本机通过等同于已上线。
 
 停止 Gateway 即可撤回尚未切换的入口；旧库、旧服务和原 Tunnel 配置未变。若后续已经切换域名，先恢复已备份的 Tunnel `service` 并重启 Tunnel，再停止 Gateway。回退前端与启动器的源码备份位于 `backups/accounts-login-20260920-163814/`；认证 DB 与账号文件保留，避免丢失新密码或恢复已撤销会话。
 
@@ -103,7 +130,7 @@ CARME_HOME/
   broker.json                   # 可信管理员配置，不提供给 Agent
 ```
 
-Docker 镜像、构建缓存和 daemon 元数据仍由 Docker 管理，不属于此目录。不要使用全局清理。持久工作区目前没有磁盘 quota 或自动删除策略，需管理员按任务记录审查保留量。
+Docker 镜像、构建缓存和 daemon 元数据仍由 Docker 管理，不属于此目录。不要使用全局清理。启用账号电脑后，新任务工作区纳入账号电脑磁盘的硬容量限制；旧 runtime/runs 与历史成果保留，仍需管理员按任务记录审查保留量。
 
 从经过审查的源码 `app/` 构建，使用自己的显式 context；不要传入 token ARG/ENV：
 

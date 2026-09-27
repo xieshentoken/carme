@@ -1,5 +1,5 @@
 /* Only cache the application shell; never API responses or conversation data. */
-const CACHE = "carme-web-v10";
+const CACHE = "carme-web-v11";
 // 与 index.html 的 ?v= 保持一致：换图标时两边一起加一，旧缓存会被 activate 清掉
 const SHELL = [
   "/",

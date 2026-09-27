@@ -1,5 +1,8 @@
 import {
+  Fragment,
   useCallback,
+  createContext,
+  useContext,
   useEffect,
   useLayoutEffect,
   useRef,
@@ -62,6 +65,7 @@ import {
 } from "lucide-react";
 
 type Agent = {
+  group_invitable?: boolean;
   id: string;
   name: string;
   title?: string;
@@ -114,7 +118,7 @@ function fileStamp() {
 type ProviderUsage = { input: number; output: number; requests: number; known: number; last: number };
 type ModelSettings = { connections: Connection[]; models: SavedModel[]; tiers?: Record<string, string[]>; allow_mock?: boolean; usage?: Record<string, ProviderUsage> };
 type EngineInfo = { id: "api" | "codex" | "pi" | "claude"; label: string; binary?: string; installed: boolean; ready: boolean; status: string; version: string; auth_status: string; capability: string; provider?: string; model?: string; auth_method?: string; profile?: string; credential_ref?: string; base_url?: string };
-type EngineSettings = { engines: EngineInfo[]; execution?: { control: string; broker: string; pi: string; action: string; browser?: string; mac_runner: string; worker_network: string; active_jobs: number } };
+type EngineSettings = { engines: EngineInfo[]; execution?: { control: string; broker: string; pi: string; action: string; browser?: string; desktop?: string; web_route?: string; mac_runner: string; worker_network: string; active_jobs: number } };
 function cliEffortOptions(engine: Agent["engine"] | EngineInfo["id"]) {
   if (engine === "claude") return ["low", "medium", "high", "xhigh", "max"];
   if (engine === "pi") return ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
@@ -148,10 +152,12 @@ function modelGroups(models: SavedModel[]) {
   return groups;
 }
 type Conversation = {
+  visitor_count?: number;
   id: string;
   title: string;
   agent_ids: string[];
   kind?: string;
+  members_revision?: number;
   updated_at?: number;
   created_at?: number;
   last_message?: string;
@@ -162,11 +168,17 @@ type Conversation = {
   unread?: boolean;
   active_agent_ids?: string[];
 };
+const isGroupChat = (c: Conversation) => c.kind === "group" || c.agent_ids.length > 1;
+
 type Message = {
+  sender_kind?: string;
+  sender_name?: string;
   id: string;
+  seq?: number;
   role: string;
   content: string;
   agent_id?: string;
+  agent_ids?: string[];
   created_at?: number;
   task_id?: string;
   attachments?: ChatFile[];
@@ -206,14 +218,34 @@ type DesktopStatus = {
   error?: string;
   platform?: string;
   // 本机桌面=local；浏览器隔离账号=browser（画面源切换到 /api/browser/screenshot）；Runner 已授权=runner（真实 Mac 屏，画面走 /api/desktop/screenshot）
-  mode?: "local" | "browser" | "runner";
+  mode?: "local" | "browser" | "runner" | "docker" | "host";
+  desktop_target?: string;
+  control_id?: string;
+  externally_controlled?: boolean;
+  free_bytes?: number;
 };
 
 // 长按判定：按住不动这么久就当作「按住左键拖动」；手指先移动超过这个距离则不算长按。
 const LONG_PRESS_MS = 450;
 const LONG_PRESS_SLOP = 10;
 
-function LocalDesktopView({ variant = "panel" }: { variant?: "panel" | "fullscreen" }) {
+function LocalDesktopView({ variant = "panel", botId = "" }: { variant?: "panel" | "fullscreen"; botId?: string }) {
+  const controlId = useRef("");
+  const controlRevision = useRef(0);
+  const controlChanging = useRef(false);
+  const desktopTarget = useRef("");
+  const desktopApi = useCallback(<T,>(path: string, body?: Record<string, unknown>) => api<T>(
+    `${path}${botId ? `?bot_id=${encodeURIComponent(botId)}` : ""}`,
+    body === undefined ? undefined : { ...body, control_id: controlId.current },
+    body === undefined ? "GET" : "POST",
+    controlId.current ? { "X-Carme-Desktop-Control": controlId.current } : {},
+  ), [botId]);
+  const closeControl = useCallback(() => {
+    if (!controlId.current) return;
+    const id = controlId.current;
+    controlId.current = ""; controlRevision.current += 1;
+    void api(`/desktop/control?bot_id=${encodeURIComponent(botId)}`, { enabled: false, control_id: id }).catch(() => {});
+  }, [botId]);
   const fullscreen = variant === "fullscreen";
   // 会话式查看：仅面板打开且 60 秒内有交互时轮询画面；超时自动断开，需手动重连。
   const IDLE_DISCONNECT_MS = 60_000;
@@ -232,6 +264,9 @@ function LocalDesktopView({ variant = "panel" }: { variant?: "panel" | "fullscre
   const lastMouseSyncAt = useRef(0);
   const lastActivity = useRef(Date.now());
   const statusRef = useRef<DesktopStatus | null>(null);
+  const lastStatusRead = useRef(0);
+  const mouseQueue = useRef<{ body: Record<string, unknown>; revision: number }[]>([]);
+  const mouseSending = useRef(false);
   // 浏览器降级：/desktop/status 的 mode=browser 时，画面源切换到 /api/browser/screenshot。
   const [browserMode, setBrowserMode] = useState(false);
   const browserModeRef = useRef(false);
@@ -260,19 +295,19 @@ function LocalDesktopView({ variant = "panel" }: { variant?: "panel" | "fullscre
   statusRef.current = status;
 
   const readStatus = useCallback(async () => {
-    return api<DesktopStatus>("/desktop/status");
-  }, []);
+    return desktopApi<DesktopStatus>("/desktop/status");
+  }, [desktopApi]);
 
   const loadFrame = useCallback(async () => {
     const browser = browserModeRef.current;
     const since = lastShotAt.current;
     let response: Response;
     try {
-      response = await fetch(`/api/${browser ? "browser" : "desktop"}/screenshot${since ? `?since=${since}` : ""}`, {
+      response = await fetch(`/api/${browser ? "browser" : "desktop"}/screenshot?bot_id=${encodeURIComponent(botId)}${since ? `&since=${since}` : ""}`, {
         cache: "no-store",
         redirect: "manual",
         credentials: "same-origin",
-        headers: authHeaders(),
+        headers: { ...authHeaders(), ...(controlId.current ? { "X-Carme-Desktop-Control": controlId.current } : {}) },
       });
     } catch {
       throw new Error(browser ? "无法读取浏览器画面；请确认 Carme 服务仍在运行。" : "无法读取本机屏幕；请确认 Carme 服务仍在运行。");
@@ -295,32 +330,47 @@ function LocalDesktopView({ variant = "panel" }: { variant?: "panel" | "fullscre
     }
     const stamp = Number(response.headers.get("x-screenshot-mtime") || "");
     if (Number.isFinite(stamp) && stamp > 0) lastShotAt.current = stamp;
+    const source = response.headers.get("x-carme-desktop-target");
+    if (source && desktopTarget.current && source !== desktopTarget.current) return;
+    const state = response.headers.get("x-carme-desktop-state");
+    const frameState: DesktopStatus | undefined = state ? JSON.parse(state) : undefined;
     const nextUrl = URL.createObjectURL(await response.blob());
     if (disposed.current) URL.revokeObjectURL(nextUrl);
     else setFrameUrl((previous) => {
       if (previous) URL.revokeObjectURL(previous);
       return nextUrl;
     });
-  }, []);
+    return frameState?.available ? frameState : undefined;
+  }, [botId]);
 
   const disconnect = useCallback(() => {
     if (timer.current) { clearTimeout(timer.current); timer.current = undefined; }
-    releaseButtonNow(); // 断开前先松开可能按住的鼠标键，别留在电脑上
+    releaseButtonNow(); closeControl(); // 断开前先松开可能按住的鼠标键，别留在电脑上
     lastShotAt.current = 0; // 重连时不带旧 since，否则 304 会卡在空画面
     setFrameUrl((previous) => {
       if (previous) URL.revokeObjectURL(previous);
       return "";
     });
     setDisconnected(true);
-  }, []);
+  }, [closeControl]);
 
   const tick = useCallback(async () => {
     if (disposed.current || inFlight.current) return;
     if (Date.now() - lastActivity.current > IDLE_DISCONNECT_MS) { disconnect(); return; }
     inFlight.current = true;
+    const started = performance.now();
+    let failed = false;
     try {
-      const next = await readStatus();
-      if (!disposed.current) {
+      const revision = controlRevision.current;
+      const cached = statusRef.current;
+      const next = cached && Date.now() - lastStatusRead.current < 2000 ? cached : await readStatus();
+      if (next !== cached) lastStatusRead.current = Date.now();
+      if (!disposed.current && !controlChanging.current && revision === controlRevision.current) {
+        if (desktopTarget.current && desktopTarget.current !== next.desktop_target) {
+          controlId.current = "";
+          setFrameUrl((previous) => { if (previous) URL.revokeObjectURL(previous); return ""; });
+        }
+        desktopTarget.current = next.desktop_target || "";
         const isBrowser = next.mode === "browser";
         if (isBrowser !== browserModeRef.current) {
           // 数据源切换：清掉旧帧，避免本机桌面最后一帧冒充浏览器画面
@@ -347,15 +397,21 @@ function LocalDesktopView({ variant = "panel" }: { variant?: "panel" | "fullscre
         }
         requestAnimationFrame(() => syncCursorDom());
       }
-      await loadFrame();
+      const frameState = await loadFrame();
+      if (frameState && !disposed.current && !controlChanging.current && revision === controlRevision.current) {
+        statusRef.current = frameState;
+        setStatus(frameState);
+        lastStatusRead.current = Date.now();
+      }
       if (!disposed.current) setError("");
     } catch (e) {
+      failed = true;
       if (!disposed.current) setError((e as Error).message);
     } finally {
       inFlight.current = false;
       if (disposed.current) return;
       if (Date.now() - lastActivity.current > IDLE_DISCONNECT_MS) { disconnect(); return; }
-      timer.current = setTimeout(() => { void tick(); }, 800);
+      timer.current = setTimeout(() => { void tick(); }, failed ? 1500 : Math.max(0, 160 - (performance.now() - started)));
     }
   }, [loadFrame, readStatus, disconnect]);
 
@@ -373,14 +429,14 @@ function LocalDesktopView({ variant = "panel" }: { variant?: "panel" | "fullscre
     return () => {
       disposed.current = true;
       if (timer.current) clearTimeout(timer.current);
-      releaseButtonNow(); // 关闭面板 / 退出弹窗时也不要留下按住的键
+      releaseButtonNow(); closeControl(); // 关闭面板 / 退出弹窗时也不要留下按住的键
       setFrameUrl((previous) => { if (previous) URL.revokeObjectURL(previous); return ""; });
     };
-  }, [tick]);
+  }, [tick, closeControl]);
 
   // 手机锁屏、切后台或关闭页面时尽力松开：这种时候不会再有 pointerup。
   useEffect(() => {
-    const onLeave = () => releaseButtonNow();
+    const onLeave = () => { releaseButtonNow(); closeControl(); };
     const onVisibility = () => { if (document.visibilityState === "hidden") onLeave(); };
     window.addEventListener("pagehide", onLeave);
     document.addEventListener("visibilitychange", onVisibility);
@@ -388,7 +444,7 @@ function LocalDesktopView({ variant = "panel" }: { variant?: "panel" | "fullscre
       window.removeEventListener("pagehide", onLeave);
       document.removeEventListener("visibilitychange", onVisibility);
     };
-  }, []);
+  }, [closeControl]);
 
   // React 的 onWheel 注册的是 passive 监听，preventDefault 无效；滚轮走原生非 passive 监听。
   useEffect(() => {
@@ -515,7 +571,7 @@ function LocalDesktopView({ variant = "panel" }: { variant?: "panel" | "fullscre
       if (!statusRef.current?.control_enabled) return;
       if (["Meta", "Control", "Shift", "Alt", "CapsLock"].includes(event.key)) return;
       const special: Record<string, string> = {
-        Enter: "return", Tab: "tab", Backspace: "delete", Delete: "delete",
+        Enter: "return", Tab: "tab", Backspace: "backspace", Delete: "forwarddelete",
         ArrowUp: "up", ArrowDown: "down", ArrowLeft: "left", ArrowRight: "right",
         PageUp: "pageup", PageDown: "pagedown", Home: "home", End: "end", " ": "space",
       };
@@ -532,7 +588,8 @@ function LocalDesktopView({ variant = "panel" }: { variant?: "panel" | "fullscre
       if (event.ctrlKey) mods.push("control");
       if (event.altKey) mods.push("option");
       if (event.shiftKey) mods.push("shift");
-      void sendKeyboard({ keys: [...mods, key].join("+") });
+      if ((statusRef.current?.mode === "docker" || statusRef.current?.mode === "host") && event.key.length === 1 && !event.ctrlKey && !event.metaKey && !event.altKey) void sendKeyboard({ text: event.key });
+      else void sendKeyboard({ keys: [...mods, key].join("+") });
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
@@ -540,10 +597,17 @@ function LocalDesktopView({ variant = "panel" }: { variant?: "panel" | "fullscre
 
 
   async function control(enabled: boolean) {
+    controlChanging.current = true; controlRevision.current += 1;
     setBusy(true);
     setError("");
     try {
-      const next = await api<DesktopStatus>("/desktop/control", { enabled });
+      const next = await desktopApi<DesktopStatus>("/desktop/control", { enabled });
+      if (disposed.current) {
+        if (next.control_id) void api(`/desktop/control?bot_id=${encodeURIComponent(botId)}`, { enabled: false, control_id: next.control_id }).catch(() => {});
+        return;
+      }
+      controlId.current = next.control_id || "";
+      statusRef.current = next;
       setStatus(next);
       if (!next.control_enabled) {
         // 后端关闭控制时会自动松开按键，这里同步清掉本地状态
@@ -556,6 +620,7 @@ function LocalDesktopView({ variant = "panel" }: { variant?: "panel" | "fullscre
     } catch (e) {
       setError((e as Error).message);
     } finally {
+      controlChanging.current = false; controlRevision.current += 1;
       setBusy(false);
     }
   }
@@ -587,15 +652,14 @@ function LocalDesktopView({ variant = "panel" }: { variant?: "panel" | "fullscre
       const scale = Math.min(rect.width / s.screen_width, rect.height / s.screen_height);
       const innerWidth = s.screen_width * scale;
       const innerHeight = s.screen_height * scale;
-      dot.style.left = `${(rect.width - innerWidth) / 2 + displayRef.current.x / s.screen_width * innerWidth}px`;
-      dot.style.top = `${(rect.height - innerHeight) / 2 + displayRef.current.y / s.screen_height * innerHeight}px`;
+      dot.style.transform = `translate(${(rect.width - innerWidth) / 2 + displayRef.current.x / s.screen_width * innerWidth}px, ${(rect.height - innerHeight) / 2 + displayRef.current.y / s.screen_height * innerHeight}px)`;
     }
   }
 
   async function sendKeyboard(body: Record<string, unknown>) {
     if (!statusRef.current?.control_enabled) return;
     try {
-      await api("/desktop/keyboard", body);
+      await desktopApi("/desktop/keyboard", body);
     } catch (e) {
       if (!disposed.current) setError((e as Error).message);
     }
@@ -603,18 +667,30 @@ function LocalDesktopView({ variant = "panel" }: { variant?: "panel" | "fullscre
 
   async function sendMouse(body: Record<string, unknown>) {
     if (!statusRef.current?.control_enabled) return;
+    const item = { body, revision: controlRevision.current };
+    const last = mouseQueue.current.at(-1);
+    // Replace only adjacent moves. Clicks and releases remain in order.
+    if (body.action === "move" && last?.body.action === "move") mouseQueue.current[mouseQueue.current.length - 1] = item;
+    else mouseQueue.current.push(item);
+    if (mouseSending.current) return;
+    mouseSending.current = true;
     try {
-      const result = await api<{ ok?: boolean; x?: number; y?: number }>("/desktop/mouse", body);
-      if (typeof result?.x === "number" && typeof result?.y === "number") {
-        // 桌面绝对路径(移动/点击/滚轮):显示与电脑真实位置同步
-        cursorRef.current = { x: result.x, y: result.y };
-        displayRef.current = cursorRef.current;
-        lastMouseSyncAt.current = Date.now();
-        requestAnimationFrame(() => syncCursorDom());
+      while (mouseQueue.current.length) {
+        const next = mouseQueue.current.shift()!;
+        if (disposed.current || next.revision !== controlRevision.current || !statusRef.current?.control_enabled) continue;
+        const result = await desktopApi<{ ok?: boolean; x?: number; y?: number }>("/desktop/mouse", next.body);
+        if (next.revision !== controlRevision.current) continue;
+        if (typeof result?.x === "number" && typeof result?.y === "number") {
+          cursorRef.current = { x: result.x, y: result.y };
+          displayRef.current = cursorRef.current;
+          lastMouseSyncAt.current = Date.now();
+          requestAnimationFrame(() => syncCursorDom());
+        }
       }
     } catch (e) {
+      mouseQueue.current = [];
       if (!disposed.current) setError((e as Error).message);
-    }
+    } finally { mouseSending.current = false; }
   }
 
   function touchGestureActive() {
@@ -673,8 +749,6 @@ function LocalDesktopView({ variant = "panel" }: { variant?: "panel" | "fullscre
       if (step) queueMoveRel(step.dx, step.dy);
       return;
     }
-    if (Date.now() - lastMove.current < 100) return;
-    lastMove.current = Date.now();
     const location = pointFrom(event.clientX, event.clientY, event.currentTarget);
     if (location) void sendMouse({ action: "move", ...location });
   }
@@ -703,7 +777,7 @@ function LocalDesktopView({ variant = "panel" }: { variant?: "panel" | "fullscre
           // 长按拖动：先按下，再发位移，顺序不能反
           pressRequested.current = "";
           try {
-            const result = await api<{ pressed?: string }>("/desktop/mouse", { action: "press", button: press });
+            const result = await desktopApi<{ pressed?: string }>("/desktop/mouse", { action: "press", button: press });
             if (!disposed.current) {
               // 请求成功就记为"按住"（除非后端明确回话说没按住）：否则一旦响应里没有
               // pressed 字段，客户端就不会再发 release，左键会被留在电脑上按下。
@@ -721,7 +795,7 @@ function LocalDesktopView({ variant = "panel" }: { variant?: "panel" | "fullscre
         const { step, rest } = takeRelativeStep(pendingRel.current);
         pendingRel.current = rest;
         try {
-          const result = await api<{ x?: number; y?: number }>("/desktop/mouse", {
+          const result = await desktopApi<{ x?: number; y?: number }>("/desktop/mouse", {
             action: "move_rel", dx: step.dx, dy: step.dy,
           });
           if (typeof result?.x === "number" && typeof result?.y === "number") {
@@ -742,7 +816,7 @@ function LocalDesktopView({ variant = "panel" }: { variant?: "panel" | "fullscre
         if (!disposed.current) setHoldActive(false);
         if (statusRef.current?.control_enabled) {
           try {
-            await api("/desktop/mouse", { action: "release", button: "left" });
+            await desktopApi("/desktop/mouse", { action: "release", button: "left" });
           } catch (e) {
             if (!disposed.current) setError((e as Error).message);
           }
@@ -861,12 +935,13 @@ function LocalDesktopView({ variant = "panel" }: { variant?: "panel" | "fullscre
     pressedRef.current = false;
     releaseRequested.current = false;
     if (!held || !statusRef.current?.control_enabled) return;
-    void api("/desktop/mouse", { action: "release", button: "left" }).catch(() => {});
+    void desktopApi("/desktop/mouse", { action: "release", button: "left" }).catch(() => {});
   }
 
   const [kbValue, setKbValue] = useState("");
   function kbSend(text: string) {
-    for (const character of text) void sendKeyboard({ keys: character });
+    if (statusRef.current?.mode === "docker" || statusRef.current?.mode === "host") void sendKeyboard({ text });
+    else for (const character of text) void sendKeyboard({ keys: character });
   }
   function kbChange(event: React.ChangeEvent<HTMLInputElement>) {
     const value = event.target.value;
@@ -887,9 +962,9 @@ function LocalDesktopView({ variant = "panel" }: { variant?: "panel" | "fullscre
   const available = Boolean(frameUrl && !disconnected && (browserMode || status?.available));
   return <section className={`local-desktop ${fullscreen ? "local-desktop-fullscreen" : ""}`}>
     <div className="local-desktop-heading">
-      <div><h3>{browserMode ? "浏览器画面" : fullscreen ? "屏幕画面" : "本机屏幕"}</h3><p>{browserMode
+      <div><h3>{browserMode ? "浏览器画面" : status?.mode === "host" ? "本机 Mac 桌面" : status?.mode === "docker" ? "Bot 独立桌面" : fullscreen ? "屏幕画面" : "本机屏幕"}</h3><p>{browserMode
         ? "显示 Bot 最近一次浏览器操作的画面（自动截图流）；60 秒无操作自动断开。"
-        : fullscreen ? "显示这台电脑的全屏画面；60 秒无操作自动断开。" : "显示运行 Carme 后端的这台 Mac 的主屏幕；60 秒无操作自动断开。"}</p></div>
+        : status?.mode === "host" ? "main 已获后台限时授权，当前连接真实宿主电脑。" : status?.mode === "docker" ? "独立 Linux 桌面；开启外部控制后可使用鼠标和键盘。" : fullscreen ? "显示这台电脑的全屏画面；60 秒无操作自动断开。" : "显示运行 Carme 后端的这台 Mac 的主屏幕；60 秒无操作自动断开。"}</p></div>
       <button type="button" className="secondary-button" onClick={() => void tick()} disabled={inFlight.current || disconnected}><RefreshCw size={14} />刷新</button>
     </div>
     <div
@@ -898,7 +973,7 @@ function LocalDesktopView({ variant = "panel" }: { variant?: "panel" | "fullscre
         ? ({ "--dr": String(status.screen_width / status.screen_height) } as React.CSSProperties)
         : undefined}
     >
-      {available ? <img ref={frame} src={frameUrl} alt={browserMode ? "Bot 浏览器画面" : "本机 Mac 屏幕"} draggable={false} onClick={click} onContextMenu={contextMenu} onPointerMove={move} onPointerDown={pointerDown} onPointerUp={pointerUp} onPointerCancel={pointerCancel} /> : (
+      {available ? <img ref={frame} src={frameUrl} alt={browserMode ? "Bot 浏览器画面" : "Bot 的电脑桌面"} draggable={false} onClick={click} onContextMenu={contextMenu} onPointerMove={move} onPointerDown={pointerDown} onPointerUp={pointerUp} onPointerCancel={pointerCancel} /> : (
         <div className="desktop-empty">
           <Monitor size={30} strokeWidth={1.3} />
           <strong>{disconnected ? "已断开" : browserMode ? "浏览器画面暂不可用" : status?.enabled === false ? "本机桌面功能已关闭" : "屏幕暂不可用"}</strong>
@@ -913,13 +988,13 @@ function LocalDesktopView({ variant = "panel" }: { variant?: "panel" | "fullscre
       <span className={`desktop-status-dot ${available ? "online" : ""}`} />
       <span>{available ? (browserMode ? "浏览器画面 · 自动截图" : `${status?.screen_width} × ${status?.screen_height}`) : disconnected ? "已断开" : "未连接"}</span>
       {holdActive && <span className="desktop-hold-badge">按住左键中</span>}
-      {!browserMode && <label className="desktop-control-toggle"><input type="checkbox" checked={Boolean(status?.control_enabled)} disabled={busy || !status?.enabled || disconnected} onChange={(event) => void control(event.target.checked)} /><span>鼠标与键盘</span></label>}
+      {!browserMode && <label className="desktop-control-toggle"><input type="checkbox" checked={Boolean(status?.control_enabled)} disabled={busy || !status?.enabled || disconnected} onChange={(event) => void control(event.target.checked)} /><span>外部控制</span></label>}
     </div>
     {fullscreen && !browserMode && <div className="desktop-keyboard-bar">
       <input
         ref={kbInput}
         type="text"
-        placeholder={status?.control_enabled ? "用手机键盘直接输入到电脑；回车发送 Enter" : "打开「鼠标与键盘」后可输入"}
+        placeholder={status?.control_enabled ? "用手机键盘直接输入到电脑；回车发送 Enter" : "打开「外部控制」后可输入"}
         disabled={!status?.control_enabled}
         value={kbValue}
         onChange={kbChange}
@@ -932,13 +1007,14 @@ function LocalDesktopView({ variant = "panel" }: { variant?: "panel" | "fullscre
         enterKeyHint="send"
       />
     </div>}
+    {status?.mode === "docker" && <p className="form-help">{typeof status.free_bytes === "number" ? `账号共享磁盘剩余 ${(status.free_bytes / 1024 ** 3).toFixed(2)} GiB。` : ""}{status.externally_controlled && !status.control_enabled ? "其他页面正在控制此 Bot。" : "外部控制开启时，Bot 暂停接收电脑操作。"}</p>}
     {(error || (!browserMode && status?.error)) && <p className="form-error" role="alert">{error || (!browserMode && status?.error)}</p>}
     {!fullscreen && browserMode && <div className="info-box desktop-permission-help"><Info size={16} /><p>本账号未授权连接本机电脑，画面已降级为 Bot 浏览器的<strong>自动截图流</strong>：Bot 在浏览器里执行任务并截图后，这里自动更新为最近一幕。画面只读、不可点击，也不会向电脑发送鼠标键盘事件。</p></div>}
-    {!fullscreen && !browserMode && <div className="info-box desktop-permission-help"><Info size={16} /><p>macOS 首次使用请在「系统设置 → 隐私与安全性 → 屏幕录制」中允许运行 Carme 的 Python（路径见 README）使用<strong>屏幕录制</strong>；远程鼠标控制还需要在<strong>辅助功能</strong>中允许它。权限变更后必须重启 Carme 服务。</p></div>}
+    {!fullscreen && !browserMode && status?.mode !== "docker" && <div className="info-box desktop-permission-help"><Info size={16} /><p>macOS 首次使用请在「系统设置 → 隐私与安全性 → 屏幕录制」中允许运行 Carme 的 Python（路径见 README）使用<strong>屏幕录制</strong>；远程鼠标控制还需要在<strong>辅助功能</strong>中允许它。权限变更后必须重启 Carme 服务。</p></div>}
     {browserMode
-      ? <p className="form-help">浏览器隔离账号的降级画面：展示 Bot 最近一次浏览器截图，随任务自动刷新（约每 2 秒）；60 秒无操作自动断开。画面只读，不提供鼠标与键盘控制；如需实时画面或人工接管，请按流程授权连接执行电脑。</p>
+      ? <p className="form-help">浏览器隔离账号的降级画面：展示 Bot 最近一次浏览器截图，随任务自动刷新（约每 2 秒）；60 秒无操作自动断开。画面只读，不提供外部控制控制；如需实时画面或人工接管，请按流程授权连接执行电脑。</p>
       : fullscreen
-      ? <p className="form-help">手机触控板：在画面上<strong>单指拖动即可移动电脑鼠标</strong>——手指位移按画面比例换算成相对位移，从电脑当前光标位置继续走，不与它原本的位置冲突；<strong>按住不动约半秒再拖动 = 按住左键拖动</strong>（选文字、拖窗口/文件，画面上光标会变成实心点提示），单指点按=在电脑当前光标位置单击，双指点按=右键。底部输入条实时向电脑打字，回车发送 Enter。60 秒无操作自动断开并停止抓屏；屏幕录制 / 辅助功能权限见侧边栏「执行电脑」。</p>
+      ? <p className="form-help">手机触控板：在画面上<strong>单指拖动即可移动电脑鼠标</strong>——手指位移按画面比例换算成相对位移，从电脑当前光标位置继续走，不与它原本的位置冲突；<strong>按住不动约半秒再拖动 = 按住左键拖动</strong>（选文字、拖窗口/文件，画面上光标会变成实心点提示），单指点按=在电脑当前光标位置单击，双指点按=右键。底部输入条实时向电脑打字，回车发送 Enter。60 秒无操作自动断开并停止抓屏。关闭面板会退出外部控制。</p>
       : <p className="form-help">画面按需连接：打开本面板或点击「重新连接」才开始查看，鼠标在画面上移动、点击或滚动会保持连接，手机端在画面上单指拖动同样移动电脑鼠标（相对位移；按住不动约半秒再拖动 = 按住左键拖动；点按=在电脑当前光标位置单击）；60 秒无操作自动断开并停止抓屏，关闭面板同样立即停止。鼠标控制只接受已认证的 Carme 前端请求，随服务重启关闭。不要在不可信网络公开 Carme 端口。</p>}
     {fullscreen && immersive && (
       <div className="desktop-immersive" role="dialog" aria-label="电脑屏幕全屏显示">
@@ -960,14 +1036,14 @@ function LocalDesktopView({ variant = "panel" }: { variant?: "panel" | "fullscre
           <span className={`desktop-status-dot ${available && !disconnected ? "online" : ""}`} />
           <span>{available ? (browserMode ? "浏览器画面 · 自动截图" : `${status?.screen_width} × ${status?.screen_height}`) : "未连接"}</span>
           {holdActive && <span className="desktop-hold-badge">按住左键中</span>}
-          {!browserMode && <label className="desktop-control-toggle"><input type="checkbox" checked={Boolean(status?.control_enabled)} disabled={busy || !status?.enabled} onChange={(event) => void control(event.target.checked)} /><span>鼠标与键盘</span></label>}
+          {!browserMode && <label className="desktop-control-toggle"><input type="checkbox" checked={Boolean(status?.control_enabled)} disabled={busy || !status?.enabled} onChange={(event) => void control(event.target.checked)} /><span>外部控制</span></label>}
           <button type="button" className="secondary-button" onClick={() => setImmersive(false)}><X size={14} />退出全屏</button>
         {available && !browserMode && <span ref={overlayDot} className={`desktop-cursor ${holdActive ? "pressed" : ""}`} aria-hidden="true" />}
         {!browserMode && <div className="desktop-immersive-kb">
           <input
             ref={overlayKbInput}
             type="text"
-            placeholder={status?.control_enabled ? "用手机键盘直接输入到电脑；回车发送 Enter" : "打开「鼠标与键盘」后可输入"}
+            placeholder={status?.control_enabled ? "用手机键盘直接输入到电脑；回车发送 Enter" : "打开「外部控制」后可输入"}
             disabled={!status?.control_enabled}
             value={kbValue}
             onChange={kbChange}
@@ -986,16 +1062,18 @@ function LocalDesktopView({ variant = "panel" }: { variant?: "panel" | "fullscre
   </section>;
 }
 
-function ComputerScreenDialog({ onClose }: { onClose: () => void }) {
+function ComputerScreenDialog({ onClose, botId, bots }: { onClose: () => void; botId: string; bots: Agent[] }) {
+  const [selectedBot, setSelectedBot] = useState(botId || bots[0]?.id || "");
   return <Modal title="Bot 的电脑 · 屏幕画面" onClose={onClose} wide className="screen-modal">
     <div className="modal-body">
-      <LocalDesktopView variant="fullscreen" />
+      <label className="form-label">选择 Bot <select value={selectedBot} onChange={(event) => setSelectedBot(event.target.value)}>{bots.map((bot) => <option key={bot.id} value={bot.id}>{bot.name}</option>)}</select></label>
+      {selectedBot && <LocalDesktopView key={selectedBot} botId={selectedBot} variant="fullscreen" />}
       <p className="form-help">需要管理执行电脑（SSH 节点、浏览器、桌面参数）时，使用侧边栏「执行电脑」。</p>
     </div>
   </Modal>;
 }
 
-function ComputerPreviewFrame({ title, note, footerIdle }: { title: string; note: string; footerIdle: string }) {
+function ComputerPreviewFrame({ title, note, footerIdle, botId }: { title: string; note: string; footerIdle: string; botId: string }) {
   // 详情页缩略画面：2 秒一帧；60 秒无操作休眠——保留最后一帧并压暗，点击唤醒恢复。
   const IDLE_DIM_MS = 60_000;
   const [status, setStatus] = useState<DesktopStatus | null>(null);
@@ -1022,7 +1100,7 @@ function ComputerPreviewFrame({ title, note, footerIdle }: { title: string; note
     if (Date.now() - lastActivity.current > IDLE_DIM_MS) { disconnect(); return; }
     inFlight.current = true;
     try {
-      const next = await api<DesktopStatus>("/desktop/status");
+      const next = await api<DesktopStatus>(`/desktop/status?bot_id=${encodeURIComponent(botId)}`);
       if (!disposed.current) {
         const isBrowser = next.mode === "browser";
         if (isBrowser !== browserModeRef.current) {
@@ -1041,7 +1119,7 @@ function ComputerPreviewFrame({ title, note, footerIdle }: { title: string; note
       const since = lastShotAt.current;
       let response: Response;
       try {
-        response = await fetch(`/api/${browser ? "browser" : "desktop"}/screenshot${since ? `?since=${since}` : ""}`, {
+        response = await fetch(`/api/${browser ? "browser" : "desktop"}/screenshot?bot_id=${encodeURIComponent(botId)}${since ? `&since=${since}` : ""}`, {
           cache: "no-store", redirect: "manual", credentials: "same-origin",
           headers: authHeaders(),
         });
@@ -1074,7 +1152,7 @@ function ComputerPreviewFrame({ title, note, footerIdle }: { title: string; note
       if (Date.now() - lastActivity.current > IDLE_DIM_MS) { disconnect(); return; }
       timer.current = setTimeout(() => { void tick(); }, 2000);
     }
-  }, [disconnect]);
+  }, [disconnect, botId]);
 
   const reconnect = useCallback(() => {
     setDisconnected(false);
@@ -1151,6 +1229,8 @@ type Approval = {
   detail?: unknown;
 };
 type Detail = {
+  event_cursor?: number;
+  delta?: boolean;
   conversation: Conversation;
   messages: Message[];
   tasks: Task[];
@@ -1201,9 +1281,11 @@ type Panel = "new" | "nodes" | "screen" | "bot" | "market" | "settings" | "routi
 type ChatAction = "pin" | "folder" | "unread" | "rename" | "edit" | "duplicate" | "copy" | "hide" | "delete";
 type ChatDialogAction = { kind: "rename" | "folder" | "delete"; conversation: Conversation };
 
+const VISITOR_ENTRY = location.pathname.match(/^\/visit\/([a-z][a-z0-9_-]{0,31})\/(c_[a-f0-9]+)$/);
 const ACCOUNT_NAME = document.documentElement.dataset.carmeAccount || "";
 function storageKey(key: string) { return ACCOUNT_NAME ? `carme:${ACCOUNT_NAME}:${key}` : key; }
 function readStorage(key: string) {
+  if (VISITOR_ENTRY) return "";
   try {
     return localStorage.getItem(storageKey(key)) || "";
   } catch {
@@ -1211,6 +1293,7 @@ function readStorage(key: string) {
   }
 }
 function saveStorage(key: string, value: string) {
+  if (VISITOR_ENTRY) return;
   try {
     value ? localStorage.setItem(storageKey(key), value) : localStorage.removeItem(storageKey(key));
   } catch {
@@ -1218,7 +1301,7 @@ function saveStorage(key: string, value: string) {
   }
 }
 // Retire the legacy secret storage and token URL immediately.
-try { localStorage.removeItem("carme_token"); } catch { /* Storage can be disabled. */ }
+try { if (!VISITOR_ENTRY) localStorage.removeItem("carme_token"); } catch { /* Storage can be disabled. */ }
 saveStorage("carme_token", "");
 if (new URLSearchParams(location.search).has("token")) {
   const url = new URL(location.href);
@@ -1344,7 +1427,7 @@ function voiceJoin(base: string, spoken: string) {
   return base + tail;
 }
 function isAccessLoginError(message: string) {
-  return message.includes("Cloudflare Access") || message.includes("非 JSON") || message.includes("实时连接中断");
+  return message.includes("Cloudflare Access") || message.includes("非 JSON");
 }
 
 /** 内置字体：后端字体列表还没到、或读取失败时的兜底选项。 */
@@ -1388,6 +1471,7 @@ async function api<T>(
   path: string,
   body?: unknown,
   method = body === undefined ? "GET" : "POST",
+  headers: Record<string, string> = {},
 ): Promise<T> {
   if (path !== "/session") await connectSession();
   let response: Response;
@@ -1399,12 +1483,13 @@ async function api<T>(
       headers: {
         ...(body !== undefined ? { "Content-Type": body instanceof Blob ? body.type : "application/json" } : {}),
         ...authHeaders(),
+        ...headers,
         ...(path === "/session" && token ? { Authorization: `Bearer ${token}` } : {}),
       },
       ...(body !== undefined ? { body: body instanceof Blob ? body : JSON.stringify(body) } : {}),
     });
   } catch {
-    throw new Error("无法读取后端响应；如果 Cloudflare Access 登录已过期，请重新打开受保护入口后再试。");
+    throw new Error("暂时无法连接 Carme，请检查网络后重试。");
   }
   const contentType = response.headers.get("content-type") || "";
   const accessHtml = contentType.includes("text/html") || response.redirected || response.type === "opaqueredirect" || response.type === "opaque" || response.status === 0 || (response.status >= 300 && response.status < 400);
@@ -1451,6 +1536,129 @@ function formatTime(value?: number, full = false) {
 function brief(value: string) {
   return value.replace(/[#*`\n]/g, " ").trim();
 }
+type Presence = "idle" | "thinking" | "working" | "waiting" | "done";
+type ToolStep = {
+  id: string;
+  conversationId: string;
+  taskId: string;
+  agentId: string;
+  tool: string;
+  phase: "running" | "done" | "error";
+};
+function useMediaQuery(query: string) {
+  const [matches, setMatches] = useState(() => window.matchMedia(query).matches);
+  useEffect(() => {
+    const media = window.matchMedia(query);
+    const onChange = () => setMatches(media.matches);
+    onChange();
+    media.addEventListener("change", onChange);
+    return () => media.removeEventListener("change", onChange);
+  }, [query]);
+  return matches;
+}
+function safeToolName(value: unknown) {
+  if (typeof value !== "string") return "";
+  const name = value.trim();
+  return /^[A-Za-z][A-Za-z0-9_]{0,80}$/.test(name) ? name : "";
+}
+function toolPhase(payload: Record<string, unknown>): "done" | "error" {
+  if (payload.status === "error" || payload.ok === false) return "error";
+  if (typeof payload.exit_code === "number" && payload.exit_code !== 0) return "error";
+  return "done";
+}
+function applyToolEvent(
+  previous: ToolStep[],
+  update: { type?: string; task_id?: unknown; agent_id?: unknown; payload?: unknown },
+  eventId: string,
+) {
+  const type = update.type;
+  if (type !== "tool.start" && type !== "tool.end") return previous;
+  const payload = update.payload && typeof update.payload === "object" ? update.payload as Record<string, unknown> : {};
+  const conversationId = typeof payload.conversation_id === "string" ? payload.conversation_id : "";
+  if (!conversationId) return previous;
+  const taskId = typeof update.task_id === "string" ? update.task_id : "";
+  const agentId = typeof update.agent_id === "string" ? update.agent_id : "";
+  const tool = safeToolName(payload.tool) || "tool";
+  const id = eventId || `${type}:${conversationId}:${taskId}:${tool}:${previous.length}`;
+  if (type === "tool.start") {
+    if (previous.some((step) => step.id === id)) return previous;
+    if (previous.some((step) => step.phase === "running" && step.conversationId === conversationId && step.taskId === taskId && step.tool === tool)) return previous;
+    const next = [...previous, { id, conversationId, taskId, agentId, tool, phase: "running" as const }];
+    return next.length > 120 ? next.slice(-120) : next;
+  }
+  const phase = toolPhase(payload);
+  for (let index = previous.length - 1; index >= 0; index -= 1) {
+    const step = previous[index];
+    if (step.phase === "running" && step.conversationId === conversationId && step.taskId === taskId && (tool === "tool" || step.tool === tool)) {
+      const copy = previous.slice();
+      copy[index] = { ...step, phase };
+      return copy;
+    }
+  }
+  const next = [...previous, { id, conversationId, taskId, agentId, tool, phase }];
+  return next.length > 120 ? next.slice(-120) : next;
+}
+const TOOL_VERBS: Record<string, [string, string, string]> = {
+  web_search: ["正在搜索", "已搜索", "搜索未完成"],
+  fetch_page: ["正在浏览", "已浏览", "浏览未完成"],
+  web_open: ["正在打开网页", "已打开网页", "打开网页未完成"],
+  web_click: ["正在操作网页", "已操作网页", "操作网页未完成"],
+  web_type: ["正在输入", "已输入", "输入未完成"],
+  shell: ["正在运行命令", "已运行命令", "命令未完成"],
+  write_file: ["正在写入文件", "已写入文件", "写入未完成"],
+  read_file: ["正在读取文件", "已读取文件", "读取未完成"],
+  read_attachment: ["正在读取附件", "已读取附件", "读取附件未完成"],
+  create_artifact: ["正在整理成果", "已整理成果", "整理成果未完成"],
+  list_skills: ["正在查看技能", "已查看技能", "查看技能未完成"],
+  use_skill: ["正在使用技能", "已使用技能", "使用技能未完成"],
+  recall: ["正在回忆", "已回忆", "回忆未完成"],
+  delegate: ["正在交给其他成员", "已交给其他成员", "委派未完成"],
+};
+function toolVerb(tool: string, phase: ToolStep["phase"]) {
+  const row = TOOL_VERBS[tool];
+  if (row) return row[phase === "running" ? 0 : phase === "done" ? 1 : 2];
+  if (tool.startsWith("mcp_")) return phase === "running" ? "正在调用插件" : phase === "done" ? "已调用插件" : "插件调用未完成";
+  return phase === "running" ? "正在处理" : phase === "done" ? "已处理" : "这一步未完成";
+}
+function dayLabel(value?: number) {
+  if (!value) return "";
+  const date = new Date(value * 1000);
+  const start = (day: Date) => new Date(day.getFullYear(), day.getMonth(), day.getDate()).getTime();
+  const diff = Math.round((start(new Date()) - start(date)) / 86400000);
+  if (diff === 0) return "今天";
+  if (diff === 1) return "昨天";
+  return `${date.getMonth() + 1}月${date.getDate()}日`;
+}
+function listTime(value?: number) {
+  if (!value) return "";
+  const date = new Date(value < 1e12 ? value * 1000 : value);
+  const start = (day: Date) => new Date(day.getFullYear(), day.getMonth(), day.getDate()).getTime();
+  const diff = Math.round((start(new Date()) - start(date)) / 86400000);
+  if (diff <= 0) return date.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" });
+  if (diff === 1) return "昨天";
+  if (diff < 7) return date.toLocaleDateString("zh-CN", { weekday: "long" });
+  return `${date.getMonth() + 1}月${date.getDate()}日`;
+}
+function ActivityFold({ steps }: { steps: ToolStep[] }) {
+  const [open, setOpen] = useState(false);
+  const current = [...steps].reverse().find((step) => step.phase === "running") || steps[steps.length - 1];
+  if (!current) return null;
+  return (
+    <div className="activity-fold">
+      <button type="button" aria-expanded={open} onClick={() => setOpen((value) => !value)}>
+        <span>{toolVerb(current.tool, current.phase)}</span>
+        {open ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+      </button>
+      {open && (
+        <ul>
+          {steps.map((step) => (
+            <li key={step.id} data-phase={step.phase}>{toolVerb(step.tool, step.phase)}</li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
 const statusText: Record<string, string> = {
   queued: "排队中",
   running: "正在处理",
@@ -1467,12 +1675,20 @@ function Avatar({
   agent,
   size = "",
   group = false,
+  members = [],
+  visitorCount = 0,
   working = false,
+  presence,
+  action = "",
 }: {
   agent?: { name?: string; emoji?: string; avatar?: BotAvatar };
   size?: string;
   group?: boolean;
+  members?: (Agent | undefined)[];
+  visitorCount?: number;
   working?: boolean;
+  presence?: Presence;
+  action?: string;
 }) {
   const [source, setSource] = useState("");
   const filename = agent?.avatar?.kind === "image" ? agent.avatar.file : "";
@@ -1491,11 +1707,22 @@ function Avatar({
     return () => { disposed = true; abort.abort(); if (objectUrl) URL.revokeObjectURL(objectUrl); };
   }, [filename, group, token]);
   const glyphAvatar = !group && !source;
+  const mode: Presence = presence || (working ? "working" : "idle");
+  const total = members.length + visitorCount + 1;
+  const visibleMembers = total > 4 ? members.slice(0, 2) : members;
+  const name = group ? `群聊，共 ${total} 位成员（含你）` : agent?.name || "Bot";
+  const active = mode === "thinking" || mode === "working" || mode === "waiting";
   return (
-    <span className={`avatar ${size} ${group ? "group" : ""} ${glyphAvatar ? "glyph-avatar" : ""} ${working ? "avatar-working" : ""}`}
-      role={working ? "img" : undefined} aria-label={working ? `${group ? "群聊成员" : agent?.name || "Bot"}正在执行任务` : undefined}>
-      <span className="avatar-face">{group ? <Users size={20} /> : source ? <img src={source} alt={`${agent?.name || "Bot"}的头像`} /> : agent?.avatar?.kind === "bot" ? working ? <BotSolid shape={agent.avatar.shape} color={agent.avatar.color} /> : <BotGlyph shape={agent.avatar.shape} color={agent.avatar.color} /> : <BotGlyph shape="circle" color="#000000" />}</span>
-      {working && <span className="avatar-orbit" aria-hidden="true" />}
+    <span className={`avatar ${size} ${group ? "group" : ""} ${glyphAvatar ? "glyph-avatar" : ""} avatar-${mode}`}
+      role={group || active || action ? "img" : undefined}
+      title={group ? `${name}${action ? `，${action}` : ""}` : action || undefined}
+      aria-label={action ? `${name}，${action}` : active ? `${name}${mode === "waiting" ? "等待你的决定" : mode === "thinking" ? "正在思考" : "正在工作"}` : group ? name : undefined}>
+      <span className="avatar-face">{group ? <span className="group-avatar-grid" aria-hidden="true">
+        <span className="group-avatar-owner">我</span>
+        {visibleMembers.map((member, index) => <Avatar key={member?.id || `missing-${index}`} agent={member} />)}
+        {Array.from({length: Math.min(visitorCount, total > 4 ? Math.max(0, 2-members.length) : visitorCount)}, (_, i)=><span className="group-avatar-owner" key={`visitor-${i}`}>客</span>)}
+        {total > 4 && <span className="group-avatar-count">+{total - 3}</span>}
+      </span> : source ? <img src={source} alt={`${agent?.name || "Bot"}的头像`} /> : agent?.avatar?.kind === "bot" ? mode === "working" ? <BotSolid shape={agent.avatar.shape} color={agent.avatar.color} /> : <BotGlyph shape={agent.avatar.shape} color={agent.avatar.color} /> : <BotGlyph shape="circle" color="#000000" />}</span>
     </span>
   );
 }
@@ -1586,48 +1813,75 @@ function IconButton({
     </button>
   );
 }
+const ModalCloseContext = createContext<() => void>(() => {});
+function useModalClose() {
+  return useContext(ModalCloseContext);
+}
+
 function Modal({
   title,
   children,
   onClose,
   wide = false,
   className = "",
+  closeDisabled = false,
 }: {
   title: string;
   children: ReactNode;
   onClose: () => void;
   wide?: boolean;
   className?: string;
+  /** true 时（如后台操作进行中）拒绝关闭，保持原生 onClose 的守卫语义 */
+  closeDisabled?: boolean;
 }) {
   const dialog = useRef<HTMLDialogElement>(null);
+  const closingRef = useRef(false);
+  const closeTimer = useRef<number | undefined>(undefined);
   useEffect(() => {
     dialog.current?.showModal();
-    return () => dialog.current?.close();
+    return () => {
+      window.clearTimeout(closeTimer.current);
+      dialog.current?.close();
+    };
   }, []);
+  /* 关闭走两拍：先 close() 让 CSS 过渡播完（display/overlay 由 allow-discrete 延迟隐藏），
+     再回调 onClose 交给父级卸载，避免弹窗“瞬消”。 */
+  function requestClose() {
+    if (closingRef.current || closeDisabled) return;
+    if (!dialog.current?.open) {
+      onClose();
+      return;
+    }
+    closingRef.current = true;
+    dialog.current.close();
+    closeTimer.current = window.setTimeout(() => onClose(), 280);
+  }
   return (
     <dialog
       ref={dialog}
       className={`modal ${wide ? "wide" : ""} ${className}`.trimEnd()}
-      onCancel={onClose}
+      onCancel={(event) => { event.preventDefault(); requestClose(); }}
       onClick={(e) => {
-        if (e.target === e.currentTarget) onClose();
+        if (e.target === e.currentTarget) requestClose();
       }}
       aria-label={title}
     >
       <div className="modal-inner">
         <header className="modal-header">
           <h2>{title}</h2>
-          <IconButton label="关闭" onClick={onClose}>
+          <IconButton label="关闭" onClick={requestClose}>
             <X size={20} />
           </IconButton>
         </header>
-        {children}
+        <ModalCloseContext.Provider value={requestClose}>
+          {children}
+        </ModalCloseContext.Provider>
       </div>
     </dialog>
   );
 }
 
-export default function App() {
+function OwnerApp() {
   const [agents, setAgents] = useState<Agent[]>([]);
   const [entry, setEntry] = useState("");
   const [conversations, setConversations] = useState<Conversation[]>([]);
@@ -1637,11 +1891,23 @@ export default function App() {
   const [defaultNode, setDefaultNode] = useState("");
   const [stats, setStats] = useState<Stats>({});
   const [connected, setConnected] = useState(false);
+  const [connectionError, setConnectionError] = useState("");
+  const detailCursor = useRef<{ id: string; cursor: number } | null>(null);
+  const detailSequence = useRef(0);
+  const syncPending = useRef<Promise<void> | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
+  const [noticeClosing, setNoticeClosing] = useState(false);
   const [search, setSearch] = useState("");
+  const [paletteOpen, setPaletteOpen] = useState(false);
+  const [paletteIndex, setPaletteIndex] = useState(0);
+  const [attachOpen, setAttachOpen] = useState(false);
+  const [toolSteps, setToolSteps] = useState<ToolStep[]>([]);
+  const [settledAgents, setSettledAgents] = useState<string[]>([]);
   const [drafts, setDrafts] = useState<Record<string, string>>({});
+  const [replyTargets, setReplyTargets] = useState<Record<string, string[]>>({});
+  const [replyPicker, setReplyPicker] = useState("");
   const [sending, setSending] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [previewFile, setPreviewFile] = useState<ChatFile | null>(null);
@@ -1659,8 +1925,11 @@ export default function App() {
   const uploadInput = useRef<HTMLInputElement>(null);
   const [panel, setPanel] = useState<Panel>(null);
   const [marketTab, setMarketTab] = useState<"bots" | "skills" | "mcp">("bots");
-  const [showDetails, setShowDetails] = useState(true);
-  const [tasksOpen, setTasksOpen] = useState(false);
+  const [showDetails, setShowDetails] = useState(false);
+  const [memberEdit, setMemberEdit] = useState<{ conversation: Conversation; ids: string[] } | null>(null);
+  const [memberBusy, setMemberBusy] = useState(false);
+  const [memberError, setMemberError] = useState("");
+  const overlayDetails = useMediaQuery("(max-width: 1120px)");
   const [mobileView, setMobileView] = useState<"list" | "chat" | "details">(
     "list",
   );
@@ -1674,8 +1943,11 @@ export default function App() {
     content: string;
     request_id: string;
     attachment_ids: string[];
+    agent_ids: string[];
   } | null>(null);
   const atBottom = useRef(true);
+  /* 已“展示过”的消息登记表：仅用于区分新到达的消息（入场动画用），见下方 useLayoutEffect */
+  const msgSeenRef = useRef<{ convoId: string; settled: boolean; ids: Set<string> }>({ convoId: "", settled: false, ids: new Set<string>() });
   const messageScroll = useRef<HTMLDivElement>(null);
   const [scrollHints, setScrollHints] = useState({ top: true, bottom: true, scrollable: false });
   function measureScrollHints() {
@@ -1700,29 +1972,59 @@ export default function App() {
     atBottom.current = where === "bottom";
   }
   const textarea = useRef<HTMLTextAreaElement>(null);
-  const searchInput = useRef<HTMLInputElement>(null);
   currentRef.current = current;
   const agentOf = (id?: string) => agents.find((agent) => agent.id === id);
-  const conversationName = (c: Conversation) => c.agent_ids.length === 1 ? agentOf(c.agent_ids[0])?.name || c.title : c.title;
-  const filteredConversations = conversations.filter((c) => `${conversationName(c)} ${c.last_message || ""}`.toLowerCase().includes(search.toLowerCase()));
+  const conversationName = (c: Conversation) => !isGroupChat(c) && c.agent_ids.length === 1 ? agentOf(c.agent_ids[0])?.name || c.title : c.title;
   const folders = Array.from(new Set(conversations.map((c) => c.folder || "").filter(Boolean))).sort();
-  const sections = [
-    { id: "pinned", title: "置顶", rows: filteredConversations.filter((c) => c.pinned_at) },
-    { id: "default", title: folders.length ? "未分组" : "聊天", rows: filteredConversations.filter((c) => !c.pinned_at && !c.folder) },
-    ...folders.map((folder) => ({ id: `folder:${folder}`, title: folder, rows: filteredConversations.filter((c) => !c.pinned_at && c.folder === folder) })),
-  ];
+  const roster = [...conversations].sort((a, b) => (b.pinned_at ? 1 : 0) - (a.pinned_at ? 1 : 0) || (b.updated_at || 0) - (a.updated_at || 0));
   const selected = detail?.conversation.id === current ? detail : null;
+  /* 新消息入场：切换会话首帧不播动画（seen.settled 在 useLayoutEffect 中置位），
+     此后新到达的消息才获得 enter 类；回看历史会话也不会重播。 */
+  const seenConvo = msgSeenRef.current;
+  const freshMessages = seenConvo.convoId === selected?.conversation.id && seenConvo.settled;
+  useLayoutEffect(() => {
+    const seen = msgSeenRef.current;
+    const convoId = selected?.conversation.id;
+    if (convoId === undefined) {
+      seen.convoId = "";
+      seen.ids = new Set();
+      seen.settled = false;
+      return;
+    }
+    if (seen.convoId !== convoId) {
+      seen.convoId = convoId;
+      seen.ids = new Set((selected?.messages || []).map((message) => message.id));
+      seen.settled = true;
+    }
+  }, [selected?.conversation.id]);
   const draftFiles = (selected?.files || []).filter((file) => !file.message_id && file.kind === "upload");
   const primary =
     agentOf(selected?.conversation.agent_ids[0]) || agentOf(entry);
-  const group = (selected?.conversation.agent_ids.length || 0) > 1;
+  const group = !!selected && isGroupChat(selected.conversation);
+  const replyTarget = group ? replyTargets[current] || [] : [];
+  const replyMembers = (selected?.conversation.agent_ids || []).flatMap((id) => {
+    const agent = agentOf(id);
+    return agent ? [agent] : [];
+  });
   const tasks = selected?.tasks || [];
   const running = tasks.filter(isRunning);
   const workingAgents = new Set(tasks.filter((task) => task.status === "running").map((task) => task.agent_id));
-  const primaryWorking = group ? workingAgents.size > 0 : workingAgents.has(primary?.id || "");
+  const workingKey = [...workingAgents].sort().join("\0");
+  const previousWorking = useRef("");
+  useEffect(() => {
+    const previous = new Set(previousWorking.current ? previousWorking.current.split("\0") : []);
+    const now = new Set(workingKey ? workingKey.split("\0") : []);
+    previousWorking.current = workingKey;
+    const finished = [...previous].filter((id) => id && !now.has(id));
+    if (!finished.length) return;
+    setSettledAgents((items) => [...new Set([...items, ...finished])]);
+    const timer = window.setTimeout(() => {
+      setSettledAgents((items) => items.filter((id) => !finished.includes(id)));
+    }, 900);
+    return () => window.clearTimeout(timer);
+  }, [workingKey]);
   const activeTask =
     running.find((t) => !t.parent_id) || tasks.find((t) => !t.parent_id);
-  const activeCliTask = activeTask?.execution_host === "backend" ? activeTask : null;
   const taskNodeId = activeTask?.node_id || activeTask?.meta?.node_id;
   const currentNode = activeTask
     ? activeTask.meta?.node ||
@@ -1750,10 +2052,19 @@ export default function App() {
   }, []);
   const refreshDetail = useCallback(async (id: string) => {
     if (!id) return;
-    const result = await api<Detail>(
-      `/conversations/${encodeURIComponent(id)}`,
-    );
-    if (currentRef.current === id) setDetail(result);
+    const sequence = ++detailSequence.current;
+    const previous = detailCursor.current;
+    const suffix = previous?.id === id ? `?after_event_id=${previous.cursor}` : "";
+    const result = await api<Detail>(`/conversations/${encodeURIComponent(id)}${suffix}`);
+    if (currentRef.current !== id || sequence !== detailSequence.current) return;
+    if (result.event_cursor !== undefined) detailCursor.current = { id, cursor: result.event_cursor };
+    setDetail((old) => {
+      if (!result.delta || old?.conversation.id !== id) return result;
+      const messages = new Map(old.messages.map((message) => [message.id, message]));
+      for (const message of result.messages) messages.set(message.id, message);
+      return { ...old, ...result, messages: [...messages.values()].sort((a, b) =>
+        (a.created_at || 0) - (b.created_at || 0) || (a.seq || 0) - (b.seq || 0)) };
+    });
   }, []);
   const refreshNodes = useCallback(async () => {
     const result = await api<{ nodes: Node[]; default_node_id: string }>(
@@ -1767,13 +2078,13 @@ export default function App() {
     setAgents(result.agents);
     setEntry(result.entry);
   }, []);
-  const sync = useCallback(async () => {
-    await Promise.all([
-      refreshList(),
-      currentRef.current
-        ? refreshDetail(currentRef.current)
-        : Promise.resolve(),
-    ]);
+  const sync = useCallback(() => {
+    if (syncPending.current) return syncPending.current;
+    const pending = Promise.all([
+      refreshList(), currentRef.current ? refreshDetail(currentRef.current) : Promise.resolve(),
+    ]).then(() => {}).finally(() => { if (syncPending.current === pending) syncPending.current = null; });
+    syncPending.current = pending;
+    return pending;
   }, [refreshList, refreshDetail]);
 
   useEffect(() => {
@@ -1796,63 +2107,132 @@ export default function App() {
       }
       setLoading(false);
     };
-    void load();
     let sse: EventSource | null = null;
+    let cursor: number | null = null;
     let refreshTimer: ReturnType<typeof setTimeout> | undefined;
-    const reconcile = () => {
-      void sync().catch((e) => {
-        if (!disposed) setError(e.message);
-      });
+    let retryTimer: ReturnType<typeof setTimeout> | undefined;
+    let reconnecting = false;
+    let loaded = false;
+    let dirty = false;
+    let syncing = false;
+    let configurationDirty = false;
+    const reconcile = async () => {
+      dirty = true;
+      if (syncing || disposed) return;
+      syncing = true;
+      try {
+        do {
+          dirty = false;
+          await sync();
+          if (!disposed && sse?.readyState === EventSource.OPEN) setConnectionError("");
+        } while (dirty && !disposed);
+      } catch (e) { if (!disposed) setConnectionError((e as Error).message); }
+      finally { syncing = false; }
     };
     const refreshConfiguration = () => {
       void Promise.all([refreshAgents(), refreshNodes(), api<Stats>("/stats").then(setStats)]).catch(() => {});
     };
-    const openEvents = async () => {
-      try { await connectSession(); } catch (e) { if (!disposed) setError((e as Error).message); return; }
-      if (disposed) return;
-      const events = new EventSource("/api/events" + (ACCOUNT_NAME ? `?account=${encodeURIComponent(ACCOUNT_NAME)}` : ""), { withCredentials: true });
+    const openEvents = () => {
+      if (disposed || cursor === null) return;
+      sse?.close();
+      const query = new URLSearchParams({ after_id: String(cursor) });
+      if (ACCOUNT_NAME) query.set("account", ACCOUNT_NAME);
+      const events = new EventSource("/api/events?" + query, { withCredentials: true });
       sse = events;
       events.onopen = () => {
-        if (!disposed) {
-          setConnected(true);
-          reconcile();
-        }
+        if (disposed || sse !== events) return;
+        clearTimeout(retryTimer);
+        setConnected(true);
+        setConnectionError("");
+        void reconcile();
       };
       events.onerror = () => {
-        if (!disposed) {
-          setConnected(false);
-      setError("实时连接中断；如果 Cloudflare Access 登录已过期，请重新打开受保护地址完成登录。");
-        }
+        if (disposed || sse !== events) return;
+        setConnected(false);
+        setConnectionError("实时连接暂时中断，正在自动重新连接…");
+        clearTimeout(retryTimer);
+        retryTimer = setTimeout(() => { void recover(); }, 3000);
       };
-      let configurationDirty = false;
       events.onmessage = (event) => {
-        try { configurationDirty ||= ["agent.updated", "models.updated", "node.updated", "cloudflare.updated"].includes(JSON.parse(event.data).type); } catch { /* Ignore malformed notifications. */ }
-        if (!refreshTimer)
-          refreshTimer = setTimeout(() => {
-            refreshTimer = undefined;
-            reconcile();
-            if (configurationDirty) { configurationDirty = false; refreshConfiguration(); }
-          }, 180);
+        if (disposed || sse !== events) return;
+        const id = Number(event.lastEventId);
+        if (Number.isSafeInteger(id) && id > (cursor || 0)) cursor = id;
+        try {
+          const update = JSON.parse(event.data) as { type?: string; task_id?: unknown; agent_id?: unknown; payload?: unknown };
+          configurationDirty ||= ["agent.updated", "models.updated", "node.updated", "cloudflare.updated"].includes(update.type || "");
+          if (update.type === "tool.start" || update.type === "tool.end") {
+            setToolSteps((previous) => applyToolEvent(previous, update, event.lastEventId));
+          }
+        } catch { return; }
+        dirty = true;
+        if (!refreshTimer) refreshTimer = setTimeout(() => {
+          refreshTimer = undefined;
+          void reconcile();
+          if (configurationDirty) { configurationDirty = false; refreshConfiguration(); }
+        }, 250);
       };
     };
-    void openEvents();
+    const recover = async () => {
+      if (disposed || reconnecting) return;
+      reconnecting = true;
+      try {
+        const session = await api<{ csrf: string }>("/session");
+        csrf = session.csrf;
+        if (disposed) return;
+        if (cursor === null) cursor = (await api<{ after_id: number }>("/events/cursor")).after_id;
+        if (!loaded) { await load(); loaded = true; }
+        refreshConfiguration();
+        openEvents();
+      } catch (e) {
+        if (!disposed) {
+          const message = (e as Error).message;
+          setConnectionError(isAccessLoginError(message) || message.includes("访问令牌") ? message : "暂时无法连接 Carme，恢复网络后将自动重连。");
+          retryTimer = setTimeout(() => { void recover(); }, 5000);
+        }
+      } finally { reconnecting = false; }
+    };
+    void (async () => {
+      try {
+        await connectSession();
+        cursor = (await api<{ after_id: number }>("/events/cursor")).after_id;
+        await load(); loaded = true;
+        openEvents();
+      } catch (e) {
+        if (!disposed) {
+          setLoading(false);
+          setConnectionError((e as Error).message);
+          retryTimer = setTimeout(() => { void recover(); }, 3000);
+        }
+      }
+    })();
     const onVisible = () => {
-      if (document.visibilityState === "visible") reconcile();
+      if (document.visibilityState !== "visible") return;
+      void reconcile();
+      if (!sse || sse.readyState !== EventSource.OPEN) void recover();
+    };
+    const onOffline = () => {
+      sse?.close();
+      setConnected(false);
+      setConnectionError("网络已断开，恢复后将自动重新连接…");
     };
     const poll = setInterval(onVisible, 15000);
     document.addEventListener("visibilitychange", onVisible);
-    window.addEventListener("online", reconcile);
+    window.addEventListener("online", onVisible);
+    window.addEventListener("offline", onOffline);
     return () => {
       disposed = true;
       sse?.close();
       clearInterval(poll);
       clearTimeout(refreshTimer);
+      clearTimeout(retryTimer);
       document.removeEventListener("visibilitychange", onVisible);
-      window.removeEventListener("online", reconcile);
+      window.removeEventListener("online", onVisible);
+      window.removeEventListener("offline", onOffline);
     };
   }, [authVersion, refreshAgents, refreshList, refreshNodes, sync]);
   useEffect(() => {
     saveStorage("carme_conversation", current);
+    detailCursor.current = null;
     setDetail(null);
     atBottom.current = true;
     if (!current) return;
@@ -1915,17 +2295,33 @@ export default function App() {
   useEffect(() => {
     const find = (event: KeyboardEvent) => {
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
+        if (document.querySelector("dialog[open]")) return;
         event.preventDefault();
-        setMobileView("list");
-        searchInput.current?.focus();
+        if (paletteOpen) setPaletteOpen(false);
+        else { setSearch(""); setPaletteIndex(0); setPaletteOpen(true); }
+      }
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "d" && document.activeElement === textarea.current) {
+        event.preventDefault();
+        toggleVoice();
       }
     };
     window.addEventListener("keydown", find);
     return () => window.removeEventListener("keydown", find);
-  }, []);
+  });
+  useEffect(() => {
+    if (!attachOpen) return;
+    const close = (event: PointerEvent) => {
+      const target = event.target;
+      if (target instanceof Element && target.closest(".attach-anchor")) return;
+      setAttachOpen(false);
+    };
+    document.addEventListener("pointerdown", close);
+    return () => document.removeEventListener("pointerdown", close);
+  }, [attachOpen]);
 
   function selectConversation(id: string) {
     setContextMenu(null);
+    setReplyPicker("");
     setCurrent(id);
     setMobileView("chat");
     setError("");
@@ -1948,14 +2344,20 @@ export default function App() {
     const content = draft.trim() || (draftFiles.length ? "请查看附件。" : "");
     if (!content || !current || sending || uploading) return;
     const conversation = current;
+    const agent_ids = [...replyTarget].sort();
+    if (agent_ids.some((id) => !selected?.conversation.agent_ids.includes(id))) {
+      setError("所选回复成员已不在群中，请重新选择。");
+      return;
+    }
     if (draftFiles.length > 4) { setError("每条消息最多 4 个附件，请先移除多余附件。"); return; }
     const attachment_ids = draftFiles.slice(0, 4).map((file) => file.id).sort();
     if (
       pendingSend.current?.conversation !== conversation ||
       pendingSend.current.content !== content ||
+      JSON.stringify(pendingSend.current.agent_ids) !== JSON.stringify(agent_ids) ||
       JSON.stringify(pendingSend.current.attachment_ids) !== JSON.stringify(attachment_ids)
     )
-      pendingSend.current = { conversation, content, request_id: requestId(), attachment_ids };
+      pendingSend.current = { conversation, content, request_id: requestId(), attachment_ids, agent_ids };
     const body = pendingSend.current;
     setSending(true);
     setError("");
@@ -1966,6 +2368,7 @@ export default function App() {
         content,
         request_id: body.request_id,
         attachment_ids,
+        ...(body.agent_ids.length ? { agent_ids: body.agent_ids } : {}),
       });
       accepted = true;
       setDrafts((prev) => ({
@@ -1974,6 +2377,8 @@ export default function App() {
           prev[conversation]?.trim() === content ? "" : prev[conversation],
       }));
       pendingSend.current = null;
+      setReplyTargets((previous) => ({ ...previous, [conversation]: [] }));
+      setReplyPicker("");
       await Promise.all([refreshList(), refreshDetail(conversation)]);
     } catch (e) {
       setError(
@@ -2236,6 +2641,98 @@ export default function App() {
     }
   }
 
+  const detailsVisible = showDetails && (!overlayDetails || mobileView === "details");
+  const computerHot = running.length > 0 || panel === "screen" || tasks.some((task) => task.status === "waiting_approval");
+  const conversationSteps = toolSteps.filter((step) => step.conversationId === current);
+  const hostedTask = new Map<string, string>();
+  for (const message of selected?.messages || []) {
+    if (message.role !== "user" && message.task_id) hostedTask.set(message.task_id, message.id);
+  }
+  const orphanSteps = conversationSteps.filter((step) => step.taskId && !hostedTask.has(step.taskId));
+  function presenceFor(agentId?: string): Presence {
+    const id = agentId || "";
+    if (id && tasks.some((task) => task.agent_id === id && task.status === "waiting_approval")) return "waiting";
+    if (id && settledAgents.includes(id)) return "done";
+    if (selected?.messages.some((message) => message.agent_id === id && message.status === "streaming" && !message.content)) return "thinking";
+    if (id && workingAgents.has(id)) return "working";
+    return "idle";
+  }
+  const headerPresence: Presence = group
+    ? (tasks.some((task) => task.status === "waiting_approval") ? "waiting" : running.length ? "working" : "idle")
+    : presenceFor(primary?.id);
+  const headerRunning = [...conversationSteps].reverse().find((step) => step.phase === "running" && (group || !step.agentId || step.agentId === primary?.id));
+  const headerAction = headerRunning ? toolVerb(headerRunning.tool, "running") : "";
+  const headerStatus = tasks.some((task) => task.status === "waiting_approval")
+    ? "等待你的决定"
+    : running.length
+      ? "正在工作"
+      : group
+        ? `${(selected?.conversation.agent_ids.length || 0) + (selected?.conversation.visitor_count || 0) + 1} 位成员（含你）`
+        : primary?.title || "把想做的事，交给你的 Bot";
+  function toggleDetails() {
+    const next = !showDetails;
+    setShowDetails(next);
+    if (window.matchMedia("(max-width: 1120px)").matches) setMobileView(next ? "details" : "chat");
+  }
+  function quoteMessage(content: string) {
+    const excerpt = content.trim().slice(0, 500);
+    if (!excerpt || !current) return;
+    const block = excerpt.split("\n").map((line) => `> ${line}`).join("\n");
+    setDrafts((prev) => {
+      const existing = prev[current] || "";
+      return { ...prev, [current]: existing.trim() ? `${existing.replace(/\s+$/, "")}\n${block}\n` : `${block}\n` };
+    });
+    textarea.current?.focus();
+  }
+  async function copyMessage(content: string) {
+    const text = content.trim();
+    if (!text) return;
+    try { await navigator.clipboard.writeText(text); setNotice("已复制"); }
+    catch { setNotice("无法写入剪贴板"); }
+  }
+  const followUp = !!(draft.trim() || draftFiles.length);
+  const showStop = !sending && running.length > 0 && !followUp;
+  const paletteQuery = search.trim().toLowerCase();
+  const paletteItems: { id: string; title: string; detail: string; run: () => void }[] = [];
+  for (const action of [
+    { id: "new", title: "新建聊天", detail: "选择一位 Bot，或组成群聊", run: () => setPanel("new") },
+    { id: "plugins", title: "插件", detail: "探索 Bot、技能与 MCP", run: () => setPanel("market") },
+    { id: "settings", title: "设置", detail: "外观、模型与连接", run: () => setPanel("settings") },
+    { id: "computer", title: "打开电脑", detail: current ? "全屏查看并接管" : "先打开一个聊天", run: () => { if (!current) { setNotice("先打开一个聊天，再查看 Bot 的电脑。"); return; } openComputerPanel(); } },
+    { id: "nodes", title: "执行电脑", detail: "登记和切换执行电脑", run: () => setPanel("nodes") },
+    { id: "history", title: "隐藏与最近删除", detail: "恢复聊天", run: () => setPanel("history") },
+  ]) {
+    if (paletteQuery && !`${action.title} ${action.detail}`.toLowerCase().includes(paletteQuery)) continue;
+    paletteItems.push({ ...action, run: () => { setPaletteOpen(false); action.run(); } });
+  }
+  let shownChats = 0;
+  for (const item of roster) {
+    const name = conversationName(item);
+    const detailText = brief(item.last_message || "开始聊点什么吧");
+    if (paletteQuery && !`${name} ${detailText}`.toLowerCase().includes(paletteQuery)) continue;
+    if (!paletteQuery && shownChats >= 8) continue;
+    shownChats += 1;
+    paletteItems.push({ id: `chat:${item.id}`, title: name, detail: detailText, run: () => { setPaletteOpen(false); selectConversation(item.id); } });
+  }
+  if (paletteQuery) {
+    for (const agent of agents) {
+      const detailText = agent.title || "Bot";
+      if (!`${agent.name} ${detailText}`.toLowerCase().includes(paletteQuery)) continue;
+      paletteItems.push({
+        id: `bot:${agent.id}`,
+        title: agent.name,
+        detail: detailText,
+        run: () => {
+          setPaletteOpen(false);
+          const existing = conversations.find((item) => !isGroupChat(item) && item.agent_ids.length === 1 && item.agent_ids[0] === agent.id);
+          if (existing) selectConversation(existing.id);
+          else void createConversation([agent.id]);
+        },
+      });
+    }
+  }
+  const activePalette = Math.min(paletteIndex, Math.max(paletteItems.length - 1, 0));
+
   return (
     <div
       className={`app-shell mobile-${mobileView} ${showDetails ? "with-details" : ""}`}
@@ -2244,37 +2741,27 @@ export default function App() {
         <header className="brand-row">
           <button
             className="brand"
-            onClick={() => {
-              setMobileView("list");
-            }}
-            aria-label="Carme 会话列表"
+            type="button"
+            onClick={() => setPanel("settings")}
+            aria-label="Carme 设置"
+            title={ACCOUNT_NAME ? `${ACCOUNT_NAME} 的工作空间` : "我的工作空间"}
           >
             <img className="brand-logo" src="/icon-192.png" alt="" />
-            <strong>Carme</strong>
           </button>
-          <IconButton label="新建聊天" onClick={() => setPanel("new")}>
-            <Plus size={20} />
-          </IconButton>
+          <div className="brand-actions">
+            <IconButton label="搜索" onClick={() => { setSearch(""); setPaletteIndex(0); setPaletteOpen(true); }}>
+              <Search size={18} />
+            </IconButton>
+            <IconButton label="新建聊天" onClick={() => setPanel("new")}>
+              <Plus size={20} />
+            </IconButton>
+          </div>
         </header>
-        <label className="search-box">
-          <Search size={16} />
-          <input
-            ref={searchInput}
-            placeholder="搜索聊天"
-            value={search}
-            onChange={(e) => setSearch(e.target.value)}
-            aria-label="搜索聊天"
-          />
-          <kbd>⌘ K</kbd>
-        </label>
-        <div className="side-label">
-          聊天 <span>{conversations.length || ""}</span>
-        </div>
         <nav className="conversation-list" aria-label="聊天列表">
-          {sections.filter((section) => section.rows.length).map((section) => <section key={section.id} aria-label={section.title}>
-            {(section.id !== "default" || folders.length > 0 || conversations.some((c) => c.pinned_at)) && <h3 className="conversation-section-label">{section.id === "pinned" && <Pin size={12} />}{section.title}</h3>}
-            {section.rows.map((c) => <ConversationRow key={c.id} conversation={c} name={conversationName(c)} agent={agentOf(c.agent_ids[0])} selected={current === c.id} onSelect={() => selectConversation(c.id)} onMenu={(x, y) => setContextMenu({conversation:c, x, y})} />)}
-          </section>)}
+          {roster.map((c) => {
+            const rowAction = [...toolSteps].reverse().find((step) => step.phase === "running" && step.conversationId === c.id);
+            return <ConversationRow key={c.id} conversation={c} name={conversationName(c)} agent={agentOf(c.agent_ids[0])} members={c.agent_ids.map(agentOf)} selected={current === c.id} presence={c.active_agent_ids?.length || rowAction ? "working" : "idle"} action={rowAction ? toolVerb(rowAction.tool, "running") : ""} onSelect={() => selectConversation(c.id)} onMenu={(x, y) => setContextMenu({conversation:c, x, y})} />;
+          })}
           {!loading && !conversations.length && (
             <div className="side-empty">
               <MessageCircle size={26} />
@@ -2285,86 +2772,68 @@ export default function App() {
             </div>
           )}
           {loading && (
-            <div className="loading-row">
-              <LoaderCircle className="spin" size={16} />
-              正在连接后端
+            <div className="conv-skeletons" role="status" aria-label="正在连接后端">
+              {[0, 1, 2].map((i) => (
+                <div className="conv-skeleton" key={i} aria-hidden="true">
+                  <span className="skeleton sk-avatar-sm" />
+                  <div>
+                    <span className="skeleton" style={{ width: `${72 - i * 9}%` }} />
+                    <span className="skeleton" style={{ width: `${52 - i * 7}%`, opacity: 0.75 }} />
+                  </div>
+                </div>
+              ))}
             </div>
           )}
-          {conversations.length > 0 && !filteredConversations.length && <p className="empty-search">没有找到相关聊天</p>}
         </nav>
-        <footer className="sidebar-footer">
-          <button className="side-action" onClick={() => setPanel("history")}><ArchiveRestore size={18} /><span>隐藏与最近删除</span></button>
-          <button className="side-action" onClick={() => setPanel("market")}>
-            <Globe size={18} />
-            <span>探索 Bot</span>
-            <ChevronRight size={15} />
-          </button>
-          <button className="side-action" onClick={() => setPanel("nodes")}>
-            <Monitor size={18} />
-            <span>执行电脑</span>
-            <span className="small-count">{nodes.length}</span>
-          </button>
-          <div className="account-row">
-            <span className="user-avatar">我</span>
-            <span className="account-name">
-              {ACCOUNT_NAME ? `${ACCOUNT_NAME} 的工作空间` : "我的工作空间"}
-              <small>
-                <i className={`connection-dot ${connected ? "live" : ""}`} />
-                {connected ? "后端已连接" : "正在重连后端"}
-              </small>
-            </span>
-            <IconButton label="设置" onClick={() => setPanel("settings")}>
-              <Settings2 size={18} />
-            </IconButton>
-          </div>
-        </footer>
       </aside>
 
       <main className="chat-pane">
-        <header className="chat-header">
-          <IconButton
-            label="返回聊天列表"
-            className="mobile-only"
-            onClick={() => setMobileView("list")}
-          >
-            <ArrowLeft size={21} />
-          </IconButton>
+        <header className={`chat-header${headerPresence === "idle" ? "" : " chat-live"}`}>
+          <div className="chat-header-side">
+            <IconButton
+              label="返回聊天列表"
+              className="mobile-only"
+              onClick={() => setMobileView("list")}
+            >
+              <ArrowLeft size={21} />
+            </IconButton>
+          </div>
           <button
             className="chat-heading"
-            onClick={() => {
+            onClick={(e) => {
+              // 点击头像（单 Bot 会话）→ 直接打开 Bot 设置；点击标题等其余区域 → 聊天详情
+              const onAvatar = e.target instanceof Element && !!e.target.closest(".avatar-anchor");
+              if (onAvatar && primary && !group) {
+                setEditingAgent(primary);
+                setPanel("bot");
+                return;
+              }
               setShowDetails(true);
               setMobileView("details");
             }}
           >
-            <span className="avatar-anchor">
-              <Avatar agent={primary} group={group} working={primaryWorking} />
+            <span className="avatar-anchor" title={headerAction || (group ? undefined : "点击打开 Bot 设置")}>
+              <Avatar agent={primary} group={group} members={selected?.conversation.agent_ids.map(agentOf)} visitorCount={selected?.conversation.visitor_count} presence={headerPresence} action={headerAction} />
               {!connected && !loading && (
                 <span className="avatar-net-badge" role="status" title="连接中断，正在自动重连" aria-label="连接中断，正在自动重连">!</span>
               )}
             </span>
             <span>
               <strong>{selected ? conversationName(selected.conversation) : "我的 Bot 团队"}</strong>
-              <small>
-                {group
-                  ? `${selected?.conversation.agent_ids.length} 位成员`
-                  : primary?.title || "把想做的事，交给你的 Bot"}
-              </small>
+              <small>{headerStatus}</small>
             </span>
-            <ChevronDown size={15} />
           </button>
-          <div className="header-actions">
+          <div className="header-actions chat-header-side">
+            <IconButton
+              label={showDetails ? "收起 Bot 的电脑" : "查看 Bot 的电脑"}
+              className={computerHot ? "monitor-live" : ""}
+              active={showDetails}
+              onClick={toggleDetails}
+            >
+              <Monitor size={19} />
+            </IconButton>
             <IconButton label="设置" onClick={() => setPanel("settings")}>
               <SlidersHorizontal size={19} />
-            </IconButton>
-            <IconButton
-              label="聊天详情"
-              active={showDetails}
-              onClick={() => {
-                setShowDetails(!showDetails);
-                if (document.documentElement.clientWidth <= 700) setMobileView("details");
-              }}
-            >
-              <MoreHorizontal size={21} />
             </IconButton>
           </div>
         </header>
@@ -2375,6 +2844,12 @@ export default function App() {
               已启用演示模型回退。标有 mock 的回复仅用于测试，不代表真实执行。
             </span>
             <button onClick={() => setPanel("settings")}>查看</button>
+          </div>
+        )}
+        {connectionError && (
+          <div className="connection-banner warning" role="status">
+            <Info size={16} /><span>{connectionError}</span>
+            {isAccessLoginError(connectionError) && <button className="secondary-button" type="button" onClick={reopenAccessEntry}>重新登录</button>}
           </div>
         )}
         {error && (
@@ -2432,14 +2907,24 @@ export default function App() {
               </div>
             </div>
           ) : !selected ? (
-            <div className="loading-row center">
-              <LoaderCircle className="spin" size={20} />
-              正在读取聊天
+            <div className="msg-skeletons" role="status" aria-label="正在读取聊天">
+              <div className="msg-skeleton me">
+                <span className="skeleton" style={{ width: "42%" }} />
+                <span className="skeleton" style={{ width: "26%" }} />
+              </div>
+              <div className="msg-skeleton">
+                <span className="skeleton sk-avatar" />
+                <div className="sk-lines">
+                  <span className="skeleton" style={{ width: "52%" }} />
+                  <span className="skeleton" style={{ width: "78%" }} />
+                  <span className="skeleton" style={{ width: "44%" }} />
+                </div>
+              </div>
             </div>
           ) : (
             <div className="messages">
               <div className="conversation-start">
-                <Avatar agent={primary} size="large" group={group} />
+                <Avatar agent={primary} size="large" group={group} members={selected?.conversation.agent_ids.map(agentOf)} visitorCount={selected?.conversation.visitor_count} />
                 <h2>{conversationName(selected.conversation)}</h2>
                 <p>
                   {group
@@ -2452,28 +2937,43 @@ export default function App() {
                   {formatTime(selected.conversation.created_at, true)}
                 </time>
               </div>
-              {selected.messages.map((message) => (
+              {selected.messages.map((message, index) => {
+                const day = dayLabel(message.created_at);
+                const showDay = !!day && day !== dayLabel(selected.messages[index - 1]?.created_at);
+                const steps = message.role !== "user" && message.task_id && hostedTask.get(message.task_id) === message.id
+                  ? conversationSteps.filter((step) => step.taskId === message.task_id)
+                  : [];
+                const streaming = message.status === "streaming";
+                const liveStep = [...steps].reverse().find((step) => step.phase === "running");
+                return (
+                <Fragment key={message.id}>
+                {showDay && <div className="day-separator">{day}</div>}
                 <article
-                  key={message.id}
-                  className={`message ${message.role === "user" ? "outgoing" : "incoming"}`}
+                  className={`message ${message.role === "user" && message.sender_kind !== "visitor" ? "outgoing" : "incoming"}${freshMessages && !seenConvo.ids.has(message.id) ? " enter" : ""}`}
                 >
                   {message.role !== "user" && (
                     <Avatar
-                      agent={agentOf(message.agent_id) || primary}
+                      agent={agentOf(message.agent_id) || (group ? undefined : primary)}
                       size="small"
+                      presence={streaming && !message.content ? "thinking" : streaming ? "working" : "idle"}
+                      action={liveStep ? toolVerb(liveStep.tool, "running") : ""}
                     />
                   )}
                   <div className="message-column">
+                    {message.sender_kind === "visitor" && <div className="message-author"><span>{message.sender_name || "访客"} · 人类访客</span></div>}
                     {message.role !== "user" && (
                       <div className="message-author">
-                        {agentOf(message.agent_id)?.name ||
-                          primary?.name ||
-                          "Bot"}
+                        <span>
+                          {agentOf(message.agent_id)?.name ||
+                            (group ? "已移除的成员" : primary?.name || "Bot")}
+                        </span>
+                        <time title={message.model ? `${message.provider || ""} / ${message.model}` : undefined}>{formatTime(message.created_at)}</time>
                       </div>
                     )}
+                    {steps.length > 0 && <ActivityFold steps={steps} />}
                     <div className="bubble">
-                      {message.status === "streaming" ? (
-                        <p className="thinking-note" role="status">正在思考... ...</p>
+                      {streaming ? (
+                        message.content ? <p className="stream-text">{message.content}<span className="stream-caret" aria-hidden="true" /></p> : null
                       ) : (
                         <Markdown
                           components={{
@@ -2504,15 +3004,22 @@ export default function App() {
                         ? <InlineImage key={file.id} file={file} onPreview={setPreviewFile} />
                         : <FileCard key={file.id} file={file} onPreview={setPreviewFile} />))}
                     </div>
-                    <div className="message-meta">
-                      <time>{formatTime(message.created_at)}</time>
-                      {message.model && <span title={message.provider && ["codex", "pi", "claude"].includes(message.provider) ? "本次任务使用的 CLI 引擎与模型设置" : "由实际 API 响应记录；供应商可能返回模型别名"}>{message.provider} / {message.model}</span>}
+                    {(message.role === "user" || message.status === "interrupted") && <div className="message-meta">
+                      {group && message.role === "user" && (!!message.agent_ids?.length || !!message.agent_id) && <span>回复成员：{(message.agent_ids?.length ? message.agent_ids : [message.agent_id]).map((id) => agentOf(id)?.name || "已移除的成员").join("、")}</span>}
+                      {message.role === "user" && <time title={message.model ? `${message.provider || ""} / ${message.model}` : undefined}>{formatTime(message.created_at)}</time>}
                       {message.status === "interrupted" && <span className="stream-state">已中断 · 部分回复</span>}
                       {message.role === "user" && <CheckCheck size={13} />}
-                    </div>
+                    </div>}
+                    {!!message.content && !streaming && <div className="message-actions">
+                      <button type="button" onClick={() => void copyMessage(message.content)}>复制</button>
+                      <button type="button" onClick={() => quoteMessage(message.content)}>回复</button>
+                    </div>}
                   </div>
                 </article>
-              ))}
+                </Fragment>
+                );
+              })}
+              {orphanSteps.length > 0 && <ActivityFold steps={orphanSteps} />}
               {(selected.approvals || [])
                 .filter((approval) => approval.status === "pending")
                 .map((approval) => (
@@ -2573,26 +3080,73 @@ export default function App() {
             </div>
           )}
         </div>
-        {scrollHints.scrollable && (!scrollHints.top || !scrollHints.bottom) && (
-          <div className="scroll-hints">
-            {!scrollHints.top && (
-              <button type="button" className="scroll-hint" aria-label="回到顶部" title="回到顶部" onClick={() => scrollMessages("top")}>
-                <ArrowUp size={15} />
-              </button>
-            )}
-            {!scrollHints.bottom && (
-              <button type="button" className="scroll-hint" aria-label="回到底部" title="回到底部" onClick={() => scrollMessages("bottom")}>
-                <ArrowDown size={15} />
-              </button>
-            )}
-          </div>
-        )}
+        {/* 常驻渲染 + hidden 类：显隐走 opacity/translate 过渡，visibility 延迟保证淡出后不可聚焦 */}
+        <div className="scroll-hints">
+          <button
+            type="button"
+            className={`scroll-hint${scrollHints.scrollable && !scrollHints.top ? "" : " hidden"}`}
+            aria-label="回到顶部"
+            title="回到顶部"
+            onClick={() => scrollMessages("top")}
+          >
+            <ArrowUp size={15} />
+          </button>
+          <button
+            type="button"
+            className={`scroll-hint${scrollHints.scrollable && !scrollHints.bottom ? "" : " hidden"}`}
+            aria-label="回到底部"
+            title="回到底部"
+            onClick={() => scrollMessages("bottom")}
+          >
+            <ArrowDown size={15} />
+          </button>
+        </div>
         </div>
         <div className="composer-area">
+          <input ref={uploadInput} type="file" multiple hidden accept=".pdf,.docx,.xlsx,.zip,.txt,.md,.csv,.json,.html,.png,.jpg,.jpeg,.webp" onChange={(event) => void uploadFiles(event.target.files)} />
+          <div className="attach-anchor">
+            <IconButton
+              label="添加附件"
+              className="composer-plus"
+              pressed={attachOpen}
+              onClick={() => { if (!uploading && !sending && current) setAttachOpen((open) => !open); }}
+            >
+              <Plus size={20} />
+            </IconButton>
+            {attachOpen && <div className="attach-menu" role="menu" aria-label="附件">
+              <button type="button" role="menuitem" onClick={() => { setAttachOpen(false); uploadInput.current?.click(); }}>添加附件</button>
+              <p>PDF（未加密，最多 100 页）、DOCX、XLSX、ZIP、UTF-8 文本、PNG / JPEG / WebP。每个不超过 10 MB，每条消息最多 4 个。语音输入用麦克风，桌面聚焦输入框后按 ⌘D。</p>
+            </div>}
+          </div>
           <form
-            className={`composer ${!current ? "disabled" : ""}`}
+            className={`composer ${group ? "group-composer" : ""} ${!current ? "disabled" : ""}`}
             onSubmit={sendMessage}
           >
+            {group && <div className="reply-target-controls">
+              <button type="button" className="reply-target-button" aria-label="选择回复成员"
+                aria-expanded={replyPicker === current} disabled={sending}
+                onClick={() => setReplyPicker((previous) => previous === current ? "" : current)}>
+                {replyTarget.length ? `@${replyTarget.map((id) => agentOf(id)?.name || "已移除的成员").join("、")}` : "@ 全体成员（依次回复）"}
+              </button>
+              {replyTarget.length > 0 && <button type="button" className="reply-target-clear" aria-label="取消指定回复成员"
+                disabled={sending} onClick={() => setReplyTargets((previous) => ({ ...previous, [current]: [] }))}><X size={14} /></button>}
+              {replyPicker === current && <div className="reply-member-picker" role="dialog" aria-label="群聊回复成员"
+                onKeyDown={(event) => { if (event.key === "Escape") { event.preventDefault(); setReplyPicker(""); textarea.current?.focus(); } }}>
+                <div className="reply-picker-title"><strong>选择回复成员（可多选）</strong>
+                  <button type="button" aria-label="关闭成员选择" onClick={() => setReplyPicker("")}><X size={16} /></button></div>
+                {replyMembers.map((agent, index) => <button type="button" className="reply-member-option" key={agent.id}
+                  aria-pressed={replyTarget.includes(agent.id)} onClick={() => {
+                    setReplyTargets((previous) => { const ids = previous[current] || []; return { ...previous, [current]: ids.includes(agent.id) ? ids.filter((id) => id !== agent.id) : [...ids, agent.id] }; });
+                    setDrafts((previous) => ({ ...previous, [current]: previous[current]?.trim() === "@" ? "" : previous[current] || "" }));
+                  }}>
+                  <Avatar agent={agent} size="small" />
+                  <span><strong>{agent.name}</strong><small>{agent.title || "群成员"}{replyMembers.filter((item) => item.name === agent.name).length > 1 ? ` · 成员 ${index + 1}` : ""}</small></span>
+                  {replyTarget.includes(agent.id) && <Check size={15} />}
+                </button>)}
+                <button type="button" className="reply-member-option" onClick={() => { setReplyTargets((previous) => ({ ...previous, [current]: [] })); setDrafts((previous) => ({ ...previous, [current]: previous[current]?.trim() === "@" ? "" : previous[current] || "" })); setReplyPicker(""); textarea.current?.focus(); }}>全体成员</button>
+                <button type="button" className="reply-member-option" onClick={() => { setDrafts((previous) => ({ ...previous, [current]: previous[current]?.trim() === "@" ? "" : previous[current] || "" })); setReplyPicker(""); textarea.current?.focus(); }}>完成选择</button>
+              </div>}
+            </div>}
             <textarea
               ref={textarea}
               rows={1}
@@ -2606,15 +3160,19 @@ export default function App() {
                   voiceRef.current.interim = "";
                 }
                 setDrafts((prev) => ({ ...prev, [current]: value }));
+                if (group && value.trim() === "@") setReplyPicker(current);
               }}
               placeholder={
                 current
-                  ? `发送消息给 ${group ? "群聊" : primary?.name || "Bot"}…`
+                  ? `给 ${group && selected ? conversationName(selected.conversation) : primary?.name || "Bot"} 发消息`
                   : "新建聊天后，开始发送消息…"
               }
               disabled={!current || sending}
               aria-label="消息"
               onKeyDown={(e) => {
+                if (e.key === "Escape" && replyPicker === current) {
+                  e.preventDefault(); setReplyPicker(""); return;
+                }
                 if (
                   e.key === "Enter" &&
                   !e.shiftKey &&
@@ -2627,14 +3185,10 @@ export default function App() {
               }}
             />
             <div className="composer-toolbar">
-              <input ref={uploadInput} type="file" multiple hidden accept=".pdf,.docx,.xlsx,.zip,.txt,.md,.csv,.json,.html,.png,.jpg,.jpeg,.webp" onChange={(event) => void uploadFiles(event.target.files)} />
-              <IconButton
-                label="添加附件"
-                onClick={() => { if (!uploading && !sending && current) uploadInput.current?.click(); }}
-              >
-                <Paperclip size={19} />
-              </IconButton>
-              {micAvailable && (
+              <span className={`composer-hint${listening ? " listening" : voiceBusy || uploading || running.length ? "" : " idle"}`}>
+                {listening ? `${micMode === "server" ? "正在听写" : "正在听"}…（${voiceSeconds}s）${voiceBusy ? " · 转写中" : ""}说完点麦克风结束` : voiceBusy ? "正在转写…" : uploading ? "正在上传并解析…" : running.length ? (followUp ? "发送后将改道当前工作" : "可以继续补充要求") : "文字、文档与图片"}
+              </span>
+              {micAvailable && !(draft.trim() && !listening && !voiceBusy) && (
                 <IconButton
                   label={listening ? "停止语音输入" : voiceBusy ? "正在转写语音" : "开始语音输入"}
                   className={`mic-button${listening ? " listening" : ""}`}
@@ -2645,17 +3199,14 @@ export default function App() {
                   <Mic size={19} />
                 </IconButton>
               )}
-              <span className={`composer-hint${listening ? " listening" : ""}`}>
-                {listening ? `${micMode === "server" ? "正在听写" : "正在听"}…（${voiceSeconds}s）${voiceBusy ? " · 转写中" : ""}说完点麦克风结束` : voiceBusy ? "正在转写…" : uploading ? "正在上传并解析…" : running.length ? "可以继续补充要求" : "文字、文档与图片"}
-              </span>
               <button
-                className={`send-button${!sending && running.length ? " stopping" : ""}`}
-                type={!sending && running.length ? "button" : "submit"}
-                disabled={!current || sending || (!running.length && uploading) || (!running.length && !draft.trim() && !draftFiles.length)}
-                aria-label={!sending && running.length ? "停止任务" : "发送消息"}
-                title={!sending && running.length ? "停止当前任务" : undefined}
+                className={`send-button${showStop ? " stopping" : ""}`}
+                type={showStop ? "button" : "submit"}
+                disabled={!current || sending || (showStop ? false : uploading || !followUp)}
+                aria-label={showStop ? "停止任务" : "发送消息"}
+                title={showStop ? "停止当前任务" : undefined}
                 onClick={
-                  !sending && running.length
+                  showStop
                     ? () => {
                         for (const task of running)
                           if (!task.parent_id)
@@ -2666,7 +3217,7 @@ export default function App() {
               >
                 {sending ? (
                   <LoaderCircle className="spin" size={19} />
-                ) : running.length ? (
+                ) : showStop ? (
                   <Square size={17} />
                 ) : (
                   <ArrowUp size={21} />
@@ -2677,9 +3228,6 @@ export default function App() {
               <button type="button" onClick={() => setPreviewFile(file)}>{file.name}</button>
               <button type="button" disabled={sending || uploading} aria-label={`移除 ${file.name}`} onClick={() => void perform(() => api(`/conversations/${encodeURIComponent(current)}/attachments/${file.id}`, undefined, "DELETE"))}><X size={14} /></button>
             </div>)}</div>}
-            <details className="upload-help"><summary>支持的附件格式与限制</summary>
-              PDF（未加密，≤100 页）、DOCX、UTF-8 TXT / MD / CSV / JSON / HTML、PNG / JPEG / WebP；每个 ≤10 MB，每条消息 ≤4 个。文本最多 50 万字符。图片边长 ≤8192 px、总像素 ≤2400 万，处理为最长边 2048 px 的 JPEG，动图仅首帧。扫描 PDF 未做 OCR；图片理解需要视觉模型。发送后附件内容会随请求交给所选模型。语音输入需 Chrome / Edge / Safari（Firefox 可改用「服务端转写」）；识别由浏览器或你在「设置 → 访问 → 语音输入」中选择的转写连接完成，首次使用需授权麦克风，本机 http 直连需为 localhost 或 https。
-            </details>
           </form>
           <div className="composer-footnote">
             Carme 可能会出错，请核实重要信息。
@@ -2696,7 +3244,7 @@ export default function App() {
           >
             <ArrowLeft size={21} />
           </IconButton>
-          <h2>聊天详情</h2>
+          <h2>详情</h2>
           <IconButton
             label="收起详情"
             onClick={() => {
@@ -2709,7 +3257,7 @@ export default function App() {
         </header>
         <div className="details-scroll">
           <div className="profile-card">
-            <Avatar agent={primary} size="hero" group={group} working={primaryWorking} />
+            <Avatar agent={primary} size="hero" group={group} members={selected?.conversation.agent_ids.map(agentOf)} visitorCount={selected?.conversation.visitor_count} presence={headerPresence} action={headerAction} />
             <h2>{selected ? conversationName(selected.conversation) : "我的 Bot 团队"}</h2>
             <span className="profile-label">
               {group ? "群聊" : primary?.title || "专属工作伙伴"}
@@ -2719,28 +3267,30 @@ export default function App() {
             <div className="section-heading">
               <h3>Bot 的电脑</h3>
               <button className="text-button" onClick={openComputerPanel}>
-                管理
+                打开电脑
                 <ChevronRight size={13} />
               </button>
             </div>
             <button className="computer-card" onClick={openComputerPanel}>
-              <ComputerPreviewFrame
-                title={activeCliTask ? "受管推理引擎" : currentNode?.name || "尚未连接执行电脑"}
-                note={activeCliTask ? activeCliTask.engine_workspace || "Bot 独立工作目录" : currentNode ? "远端桌面暂未接入" : "正在连接本机屏幕…"}
-                footerIdle={activeCliTask ? "任务执行边界" : currentNode ? "桌面未连接" : "等待屏幕画面"}
-              />
+              {detailsVisible ? <ComputerPreviewFrame key={primary?.id || ""} botId={primary?.id || ""}
+                title={primary?.execution_target === "container" ? `${primary.name} 的独立电脑` : currentNode?.name || "Bot 的电脑"}
+                note={primary?.execution_target === "container" ? "独立桌面 · 账号内共享软件" : "点击查看电脑画面"}
+                footerIdle={running.length ? "正在使用" : "桌面未连接"}
+              /> : <div className="computer-placeholder">
+                <Monitor size={33} strokeWidth={1.2} />
+                <strong>Bot 的电脑</strong>
+                <span>打开详情后显示画面</span>
+              </div>}
             </button>
-            <p className="detail-note">
-              {activeCliTask
-                ? `当前任务使用专用 runtime；历史工作目录记录：${activeCliTask.engine_workspace || "Bot 独立目录"}。`
-                : activeTask
-                ? `当前任务${currentNode ? `固定使用 ${currentNode.name}` : "未绑定执行电脑"}。`
-                : "执行电脑暂定为 2018 MacBook，可随时更换。"}{" "}
-              {activeCliTask ? " 执行目标与权限修改只对新授权生效。" : " 更换默认电脑只影响新任务。"}
-            </p>
+            <p className="detail-note">{running.length ? "Bot 正在使用自己的电脑。需要时再全屏接管，看完可以交还。" : "这是 Bot 自己的电脑。需要时再打开，看完可以交还。"}</p>
           </section>
           <section className="detail-section">
             <h3>成员</h3>
+            {group && selected && <button className="secondary-button" onClick={() => setChatAction({kind: "rename", conversation: selected.conversation})}>修改群聊名称</button>}
+            {group && selected && <button className="secondary-button" disabled={!!memberEdit} onClick={() => {
+              setMemberError(""); setMemberEdit({ conversation: selected.conversation, ids: selected.conversation.agent_ids.filter((id) => !!agentOf(id)) });
+            }}>管理群成员</button>}
+            {group && selected && <VisitorMembers key={selected.conversation.id} cid={selected.conversation.id} onChanged={()=>void sync()}/>}
             {(selected?.conversation.agent_ids || (entry ? [entry] : [])).map(
               (id) => (
                 <button
@@ -2751,9 +3301,9 @@ export default function App() {
                     if (agent) void editBot(agent);
                   }}
                 >
-                  <Avatar agent={agentOf(id)} size="small" working={workingAgents.has(id)} />
+                  <Avatar agent={agentOf(id)} size="small" presence={presenceFor(id)} action={(() => { const step = [...conversationSteps].reverse().find((item) => item.phase === "running" && item.agentId === id); return step ? toolVerb(step.tool, "running") : ""; })()} />
                   <span>
-                    <strong>{agentOf(id)?.name || id}</strong>
+                    <strong>{agentOf(id)?.name || "已移除的成员"}</strong>
                     <small>{agentOf(id)?.title || "Bot"}</small>
                   </span>
                   <ChevronRight size={15} />
@@ -2761,50 +3311,36 @@ export default function App() {
               ),
             )}
           </section>
-          {!!tasks.length && (
+          {!!running.length && (
             <section className="detail-section">
-              <button type="button" className="section-toggle" aria-expanded={tasksOpen} onClick={() => setTasksOpen((open) => !open)}>
-                <span className="section-title">任务与验收</span>
-                <span className="section-count">{tasks.length}</span>
-                {tasksOpen ? <ChevronDown size={15} /> : <ChevronRight size={15} />}
-              </button>
-              <div className="section-body" hidden={!tasksOpen}>
-              {tasks.map((task) => (
-                <div key={task.id} className={`task-activity ${task.status === "failed" ? "failed" : ""}`}>
-                  {isRunning(task) ? (
-                    <Avatar agent={agentOf(task.agent_id)} working={task.status === "running"} />
-                  ) : <span className="activity-icon"><Info size={16} /></span>}
-                  <div>
-                    <strong>
-                      {agentOf(task.agent_id)?.name || task.agent_id}{" "}
-                      <span>{statusText[task.status] || task.status}</span>
-                    </strong>
-                    {task.parent_id && <small>成员协作 · {task.title || "子任务"}</small>}
-                    {task.execution_host === "backend" && <small>本机 CLI · 后端 Mac · {task.engine_workspace || "Bot 独立工作目录"}</small>}
-                    {task.execution_host === "node" && task.node_name && <small>API 引擎 · 执行电脑：{task.node_name}</small>}
-                    {task.cost_known === false && <small>费用未知（CLI 供应商未提供可核对的计费数据）</small>}
-                    {task.error && <p>{task.error}</p>}
-                  </div>
-                  {isRunning(task) && (
-                    <button
-                      className="text-button"
-                      onClick={() =>
-                        void perform(
-                          () => api(`/tasks/${encodeURIComponent(task.id)}/cancel`, {}),
-                          "任务已请求停止",
-                        )
-                      }
-                    >
-                      <Square size={12} />
-                      停止
-                    </button>
-                  )}
+              <h3>当前任务</h3>
+              <div className="task-activity">
+                <div>
+                  <strong>
+                    {agentOf(running[0].agent_id)?.name || "Bot"}{" "}
+                    <span>{statusText[running[0].status] || running[0].status}</span>
+                  </strong>
                 </div>
-              ))}
-              {tasks.filter((t) => !isRunning(t)).map((task) => <TaskEvidence key={task.id} taskId={task.id} title={task.title || task.id} />)}
+                <button
+                  className="text-button"
+                  onClick={() =>
+                    void perform(
+                      () => api(`/tasks/${encodeURIComponent((running.find((task) => !task.parent_id) || running[0]).id)}/cancel`, {}),
+                      "任务已请求停止",
+                    )
+                  }
+                >
+                  <Square size={12} />
+                  停止
+                </button>
               </div>
             </section>
           )}
+          <section className="detail-section">
+            <h3>例行任务</h3>
+            <p className="detail-note">例行任务尚未开放。之后可以在这里查看按时间重复的工作，现在不会假装已经排上日程。</p>
+            <span className="subtle-tag">尚未接入调度器</span>
+          </section>
           <section className="detail-section settings-list">
             <button onClick={() => setPanel("memory")}><FileText size={17} /><span>记忆管理</span><ChevronRight size={15} /></button>
             <button disabled={!current} onClick={() => setPanel("summary")}><MessageCircle size={17} /><span>长对话摘要</span><ChevronRight size={15} /></button>
@@ -2822,16 +3358,6 @@ export default function App() {
               <span>Bot 设置</span>
               <ChevronRight size={15} />
             </button>
-            <button onClick={() => setPanel("routine")}>
-              <Clock3 size={17} />
-              <span>例行任务</span>
-              <span className="subtle-tag">待开放</span>
-            </button>
-            <button onClick={() => setPanel("settings")}>
-              <Bell size={17} />
-              <span>通知</span>
-              <ChevronRight size={15} />
-            </button>
           </section>
           <div className="details-bottom">
             <ShieldCheck size={16} />
@@ -2840,6 +3366,40 @@ export default function App() {
         </div>
       </aside>
 
+      {memberEdit && <Modal title="管理群成员" closeDisabled={memberBusy} onClose={() => { if (!memberBusy) setMemberEdit(null); }}>
+        <div className="modal-body">
+          <p className="detail-note">保留 1–6 位 Bot。移除只退出本群，Bot、记忆和聊天记录都会保留。</p>
+          <p className="small-section-label">已选 {memberEdit.ids.length} 位 Bot · 新成员仅列出用户创建的 Bot</p>
+          <div className="picker-list">
+            {[...new Set([...memberEdit.conversation.agent_ids.filter((id) => !!agentOf(id)), ...agents.filter((a) => a.group_invitable).map((a) => a.id)])].map((id) => {
+              const agent = agentOf(id); const checked = memberEdit.ids.includes(id);
+              return <button key={id} type="button" aria-pressed={checked}
+                disabled={memberBusy || (!checked && memberEdit.ids.length >= 6)} onClick={() => setMemberEdit((previous) => previous && ({ ...previous,
+                  ids: checked ? previous.ids.filter((value) => value !== id) : [...previous.ids, id] }))}>
+                <Avatar agent={agent} /><span><strong>{agent?.name || "已移除的成员"}</strong>
+                <small>{agent?.title || "Bot"}{memberEdit.conversation.agent_ids.includes(id) ? " · 当前成员" : " · 可邀请"}</small></span>
+                <span className={`selection-check ${checked ? "checked" : ""}`}>{checked && <Check size={14} />}</span>
+              </button>;
+            })}
+          </div>
+          {((selected?.conversation.id === memberEdit.conversation.id && running.length > 0) || memberError.includes("未结束任务")) &&
+            <p className="detail-note">保存前将停止本群尚未结束的任务；已执行的操作不会撤销。</p>}
+          {memberError && <p className="form-error" role="alert">{memberError}</p>}
+          <button className="primary-button full-width" disabled={memberBusy || !memberEdit.ids.length} onClick={async () => {
+            setMemberBusy(true);
+            const stop = (selected?.conversation.id === memberEdit.conversation.id && running.length > 0) || memberError.includes("未结束任务");
+            setMemberError("");
+            try {
+              await api(`/conversations/${encodeURIComponent(memberEdit.conversation.id)}/members`, {
+                agent_ids: memberEdit.ids, expected_revision: memberEdit.conversation.members_revision || 0, stop_tasks: stop,
+              }, "PATCH");
+              await Promise.all([refreshList(), refreshDetail(memberEdit.conversation.id)]);
+              setMemberEdit(null);
+            } catch (e) { setMemberError((e as Error).message); }
+            finally { setMemberBusy(false); }
+          }}>{memberBusy ? "正在保存…" : ((selected?.conversation.id === memberEdit.conversation.id && running.length > 0) || memberError.includes("未结束任务")) ? "停止任务并保存" : "保存成员"}</button>
+        </div>
+      </Modal>}
       {panel === "new" && (
         <NewChat
           agents={agents}
@@ -2853,7 +3413,7 @@ export default function App() {
         />
       )}
       {panel === "screen" && (
-        <ComputerScreenDialog onClose={() => setPanel(null)} />
+        <ComputerScreenDialog botId={primary?.id || ""} bots={agents} onClose={() => setPanel(null)} />
       )}
       {panel === "nodes" && (
         <NodesDialog
@@ -2877,7 +3437,7 @@ export default function App() {
       )}
       {panel === "memory" && <MemoryDialog agents={agents} initialId={primary?.id || entry} onClose={() => setPanel(null)} />}
       {panel === "summary" && <Modal title="长对话摘要" onClose={() => setPanel(null)}><div className="modal-body">
-        <p className="detail-note">对话超过 40 条或约 2.4 万字符时自动压缩较早内容，保留近期消息。原始聊天不会删除，切换模型会沿用摘要。摘要可能遗漏细节，请核对重要事实。</p>
+        <p className="detail-note">长对话会按当前引擎的上下文预算整理较早内容，保留近期消息与关键进展。原始聊天不会删除。摘要可能遗漏细节，请核对重要事实。</p>
         {selected?.summary ? <><small>{selected.summary.model} · {new Date(selected.summary.updated_at * 1000).toLocaleString()}</small><div className="document-preview"><Markdown>{selected.summary.content}</Markdown></div></> : <p>当前会话尚未生成摘要。</p>}
       </div></Modal>}
       {panel === "files" && <Modal title="附件与成果" onClose={() => setPanel(null)}><div className="modal-body archive-list">
@@ -2956,6 +3516,10 @@ export default function App() {
           connected={connected}
           onModelsSaved={() => { void api<Stats>("/stats").then(setStats); }}
           onMigrated={() => { void refreshAgents(); void refreshList(); void api<Stats>("/stats").then(setStats); }}
+          onOpenLibrary={(target) => {
+            if (target === "skills") setMarketTab("skills");
+            setPanel(target === "skills" ? "market" : "history");
+          }}
           onClose={() => setPanel(null)}
           onConnect={(value) => {
             token = value;
@@ -2970,10 +3534,9 @@ export default function App() {
       {chatAction && <ChatActionDialog key={`${chatAction.kind}:${chatAction.conversation.id}`} action={chatAction} name={conversationName(chatAction.conversation)} folders={folders} onClose={() => setChatAction(null)} onApply={async (value) => {
         const c = chatAction.conversation;
         if (chatAction.kind === "rename") {
-          if (c.agent_ids.length === 1) { await api(`/agents/${encodeURIComponent(c.agent_ids[0])}`, {name:value}, "PATCH"); await refreshAgents(); }
+          if (!isGroupChat(c) && c.agent_ids.length === 1) { await api(`/agents/${encodeURIComponent(c.agent_ids[0])}`, {name:value}, "PATCH"); await refreshAgents(); }
           else await changeChat(c, {title:value});
         } else await changeChat(c, chatAction.kind === "folder" ? {folder:value} : {deleted:true});
-        setChatAction(null);
       }} />}
       {panel === "history" && <HiddenChatsDialog agents={agents} onClose={() => setPanel(null)} onRestored={refreshList} />}
       {panel === "routine" && (
@@ -2990,11 +3553,45 @@ export default function App() {
           </div>
         </Modal>
       )}
+      {paletteOpen && (
+        <div className="palette-backdrop" onMouseDown={() => setPaletteOpen(false)}>
+          <div
+            className="palette"
+            role="dialog"
+            aria-label="搜索"
+            onMouseDown={(event) => event.stopPropagation()}
+            onKeyDown={(event) => {
+              if (event.key === "Escape") { setPaletteOpen(false); return; }
+              if (event.key === "ArrowDown") { event.preventDefault(); setPaletteIndex((index) => Math.min(index + 1, Math.max(paletteItems.length - 1, 0))); }
+              if (event.key === "ArrowUp") { event.preventDefault(); setPaletteIndex((index) => Math.max(index - 1, 0)); }
+              if (event.key === "Enter" && paletteItems[activePalette]) { event.preventDefault(); paletteItems[activePalette].run(); }
+            }}
+          >
+            <input autoFocus placeholder="搜索 Bot、聊天或动作" aria-label="搜索" value={search} onChange={(event) => { setSearch(event.target.value); setPaletteIndex(0); }} />
+            <div className="palette-list" role="listbox">
+              {paletteItems.map((item, index) => (
+                <button type="button" key={item.id} role="option" aria-selected={index === activePalette} onMouseEnter={() => setPaletteIndex(index)} onClick={item.run}>
+                  <strong>{item.title}</strong>
+                  {item.detail && <small>{item.detail}</small>}
+                </button>
+              ))}
+              {!paletteItems.length && <p className="muted">没有匹配的结果</p>}
+            </div>
+          </div>
+        </div>
+      )}
       {notice && (
-        <div className="toast" role="status">
+        <div className={`toast${noticeClosing ? " closing" : ""}`} role="status">
           <Info size={17} />
           {notice}
-          <button aria-label="关闭提示" onClick={() => setNotice("")}>
+          <button
+            aria-label="关闭提示"
+            onClick={() => {
+              if (noticeClosing) return;
+              setNoticeClosing(true);
+              window.setTimeout(() => { setNotice(""); setNoticeClosing(false); }, 170);
+            }}
+          >
             <X size={16} />
           </button>
         </div>
@@ -3045,7 +3642,7 @@ function NewChat({
     }
   }
   return (
-    <Modal title={group ? "创建群聊" : "新建聊天"} onClose={onClose}>
+    <Modal title="新建聊天" onClose={onClose}>
       <div className="modal-body">
         <label className="search-box modal-search">
           <Search size={17} />
@@ -3093,21 +3690,21 @@ function NewChat({
           </label>
         )}
         <p className="small-section-label">
-          {group ? "选择成员（至少 2 位）" : "成员"}
+          {group ? `收件人（2–6 位，已选 ${selected.length}）` : "收件人"}
         </p>
         <div className="picker-list">
           {agents
-            .filter((agent) => `${agent.name} ${agent.title}`.includes(search))
+            .filter((agent) => (!group || agent.group_invitable) && `${agent.name} ${agent.title}`.includes(search))
             .map((agent) => (
               <button
-                disabled={busy}
+                disabled={busy || (group && selected.length >= 6 && !selected.includes(agent.id))}
                 key={agent.id}
                 onClick={() =>
                   group
                     ? setSelected((previous) =>
                         previous.includes(agent.id)
                           ? previous.filter((id) => id !== agent.id)
-                          : [...previous, agent.id],
+                          : previous.length >= 6 ? previous : [...previous, agent.id],
                       )
                     : void create([agent.id])
                 }
@@ -3129,8 +3726,8 @@ function NewChat({
               </button>
             ))}
         </div>
-        {!agents.length && (
-          <p className="muted">尚未加载到 Bot，请检查后端连接。</p>
+        {!(group ? agents.filter((agent) => agent.group_invitable) : agents).length && (
+          <p className="muted">{group ? "没有可邀请的 Bot，请先创建 Bot。" : "尚未加载到 Bot，请检查后端连接。"}</p>
         )}
         {error && (
           <p className="form-error" role="alert">
@@ -3148,7 +3745,7 @@ function NewChat({
             ) : (
               <Users size={16} />
             )}
-            创建群聊{selected.length > 0 ? `（${selected.length}）` : ""}
+            创建群聊{selected.length > 0 ? `（${selected.length}/6）` : ""}
           </button>
         )}
       </div>
@@ -3227,7 +3824,7 @@ function NodesDialog({
                 客户端分别承担其他职责。
               </p>
             </div>
-            <LocalDesktopView />
+            <p className="form-help">请从会话详情中的「Bot 的电脑」打开对应 Bot 的桌面。</p>
             <div className="node-list">
               {nodes.map((node) => (
                 <div className="node-card" key={nodeId(node)}>
@@ -3591,6 +4188,15 @@ function ImageLightbox({ file, onClose }: { file: ChatFile; onClose: () => void 
   const [actualSize, setActualSize] = useState(false);
   const [zoomable, setZoomable] = useState(false);
   useEffect(() => { closeRef.current = onClose; }, [onClose]);
+  const closingRef = useRef(false);
+  const closeTimer = useRef<number | undefined>(undefined);
+  /* 两拍关闭：先 close() 播 CSS 退场过渡（lightbox 无 keyframes 需求，直接 transition），再卸载 */
+  function requestClose() {
+    if (closingRef.current) return;
+    closingRef.current = true;
+    dialog.current?.close();
+    closeTimer.current = window.setTimeout(() => closeRef.current(), 220);
+  }
   useEffect(() => {
     let alive = true, objectUrl = "";
     setLoading(true); setError(""); setUrl(""); setActualSize(false); setZoomable(false);
@@ -3613,7 +4219,7 @@ function ImageLightbox({ file, onClose }: { file: ChatFile; onClose: () => void 
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key !== "Escape") return;
       event.preventDefault();
-      closeRef.current();
+      requestClose();
     };
     window.addEventListener("keydown", onKeyDown);
     return () => {
@@ -3643,19 +4249,20 @@ function ImageLightbox({ file, onClose }: { file: ChatFile; onClose: () => void 
   return <dialog
     // 兜底：任何原生关闭路径（浏览器自己处理的 Esc 等）都要把 React 状态一起收掉，
     // 否则 dialog 关了而 previewFile 还在，界面会卡成一个看不见的弹窗。
-    onClose={onClose}
+    // 两拍关闭期间（closingRef=true）忽略 close 事件，交给 requestClose 的定时器回调。
+    onClose={() => { if (!closingRef.current) onClose(); }}
     ref={dialog}
     className="lightbox"
     role="dialog"
     aria-modal="true"
     aria-label={`放大查看 ${file.name}`}
-    onCancel={onClose}
+    onCancel={requestClose}
     onClick={(event) => {
       const target = event.target;
       if (target instanceof HTMLButtonElement) return;
       if (target instanceof HTMLImageElement) { if (zoomable) setActualSize((value) => !value); return; }
       if (target instanceof HTMLElement && target.closest(".lightbox-error")) return;
-      onClose();
+      requestClose();
     }}
   >
     <div className="lightbox-actions">
@@ -3664,7 +4271,7 @@ function ImageLightbox({ file, onClose }: { file: ChatFile; onClose: () => void 
         onClick={() => setActualSize((value) => !value)}>{actualSize ? <ZoomOut size={19} /> : <ZoomIn size={19} />}</button>}
       <button type="button" className="lightbox-action lightbox-download" aria-label="下载原图" title="下载原图"
         aria-busy={busy} disabled={busy} onClick={() => void download()}>{busy ? <LoaderCircle size={19} className="spin" /> : <Download size={19} />}</button>
-      <button type="button" ref={closeButton} className="lightbox-action" aria-label="关闭放大查看" title="关闭放大查看" onClick={onClose}><X size={20} /></button>
+      <button type="button" ref={closeButton} className="lightbox-action" aria-label="关闭放大查看" title="关闭放大查看" onClick={requestClose}><X size={20} /></button>
     </div>
     <div className={`lightbox-stage${actualSize ? " actual" : ""}`}>
       {loading ? <p className="lightbox-status"><LoaderCircle size={20} className="spin" />正在载入图片…</p>
@@ -3725,7 +4332,14 @@ function MemoryDialog({ agents, initialId, onClose }: { agents: Agent[]; initial
         {deleting === item.key && <button type="button" onClick={() => setDeleting("")}>取消删除</button>}
       </div>
     </article>)}</div>
-    {!rows.length && <p>{busy ? "正在读取…" : "这个范围还没有记忆。"}</p>}
+    {!rows.length && (busy ? (
+      <div className="sk-stack" role="status" aria-label="正在读取记忆">
+        <span className="skeleton" style={{ width: "34%" }} />
+        <span className="skeleton" style={{ width: "88%" }} />
+        <span className="skeleton" style={{ width: "63%" }} />
+        <span className="skeleton" style={{ width: "47%" }} />
+      </div>
+    ) : <p>这个范围还没有记忆。</p>)}
     <h3>{editing ? "编辑记忆" : "新增记忆"}</h3>
     <label className="form-label">名称<input aria-label="记忆名称" value={key} disabled={editing || busy} maxLength={160} onChange={(e) => setKey(e.target.value)} /></label>
     <label className="form-label">内容<textarea aria-label="记忆内容" value={value} disabled={busy} maxLength={20000} rows={4} onChange={(e) => setValue(e.target.value)} /></label>
@@ -3745,6 +4359,7 @@ function BotDialog({
   onClose: () => void;
   onSaved: () => Promise<void>;
 }) {
+  const requestClose = useModalClose();
   const [data, setData] = useState<Agent>({
     id: agent?.id || "",
     name: agent?.name || "",
@@ -4028,7 +4643,7 @@ function BotDialog({
           </p>
         )}
         <div className="form-actions">
-          <button type="button" className="secondary-button" onClick={onClose}>
+          <button type="button" className="secondary-button" onClick={requestClose}>
             取消
           </button>
           <button type="submit" className="primary-button" disabled={busy || avatarBusy}>
@@ -4041,12 +4656,12 @@ function BotDialog({
   );
 }
 const SETTINGS_TABS = [
+  { id: "account", label: "账号", icon: ShieldCheck },
   { id: "general", label: "通用", icon: Settings2 },
   { id: "models", label: "模型", icon: Cpu },
   { id: "agents", label: "Agent", icon: Users },
   { id: "migration", label: "迁移", icon: Download },
-  { id: "notify", label: "通知", icon: Bell },
-  { id: "access", label: "访问", icon: Globe },
+  { id: "remote", label: "远程访问", icon: Globe },
   { id: "about", label: "关于", icon: CircleHelp },
 ] as const;
 type SettingsTab = (typeof SETTINGS_TABS)[number]["id"];
@@ -4104,7 +4719,7 @@ function AccountPasswordSection() {
           <button type="submit" className="secondary-button" disabled={busy}>
             {busy ? "保存中…" : "修改密码"}
           </button>
-          <p className="form-help">修改后会撤销该账号在所有设备上的登录会话（包括这台），需要用新密码重新登录。忘记当前密码请联系管理员重置。</p>
+          <p className="form-help">改完后，这个账号在所有设备上都要重新登录。</p>
           {error && <p role="alert" className="form-error">{error}</p>}
         </form>
       )}
@@ -4207,7 +4822,7 @@ function VoiceInputSettings() {
   }
   return <div className="settings-section">
     <h3><Mic size={17} />语音输入</h3>
-    <p className="form-help">聊天输入框的麦克风按钮：说话转成文字后仍由你确认再发送。服务端转写会边说边更新文字。</p>
+    <p className="form-help">说话转成文字后，由你确认再发送。</p>
     <div className="form-grid">
       <label className="form-label">识别方式<select aria-label="语音识别方式" value={config.mode} disabled={busy}
         onChange={(e) => {
@@ -4218,42 +4833,41 @@ function VoiceInputSettings() {
         }}>
         <option value="browser">浏览器识别（Chrome / Edge / Safari）</option>
         <option value="server">服务端转写（可配置任意语音识别接口）</option>
-      </select><small>{supported ? "浏览器识别由 Chrome（Google）或 Safari（Apple）完成，音频不经过 Carme 后端。" : "当前浏览器不支持浏览器识别，建议改用服务端转写。"}</small></label>
+      </select>{!supported && <small>这个浏览器不能本地识别，请改用服务端转写。</small>}</label>
       <label className="form-label">识别语言<select aria-label="语音识别语言" value={lang} onChange={(e) => updateLang(e.target.value)}>
         {VOICE_LANGS.map((item) => <option key={item.id} value={item.id}>{item.label}</option>)}
-      </select><small>保存在此设备。</small></label>
+      </select></label>
     </div>
     {config.mode === "server" && <>
       <label className="form-label">接口来源<select aria-label="语音识别接口来源" value={config.source} disabled={busy}
         onChange={(e) => setConfig({ ...config, source: e.target.value === "custom" ? "custom" : "connection" })}>
         <option value="custom">直接填写语音识别接口</option>
         <option value="connection">已配置的模型连接</option>
-      </select><small>两者都调用 OpenAI 兼容的 /audio/transcriptions。</small></label>
+      </select></label>
       {config.source === "custom" ? <>
         <label className="form-label">服务商预设<select aria-label="语音识别服务商预设" value={preset} disabled={busy}
           onChange={(e) => applyPreset(e.target.value)}>
           {ASR_PRESETS.map((item) => <option key={item.id} value={item.id}>{item.label}</option>)}
-        </select><small>选择后自动填好接口地址与常见型号，可再手动修改。</small></label>
+        </select></label>
         <label className="form-label">接口地址<input aria-label="语音识别接口地址" value={config.base_url} disabled={busy}
           placeholder="https://api.siliconflow.cn/v1" onChange={(e) => setConfig({ ...config, base_url: e.target.value })} /></label>
         <label className="form-label">API Key<input type="password" aria-label="语音识别 API Key" value={apiKey} disabled={busy}
           autoComplete="off" placeholder={hasKey ? "已保存密钥（留空表示不修改）" : "粘贴语音识别接口的密钥"}
           onChange={(e) => setApiKey(e.target.value)} />
-          <small>{hasKey ? "密钥已保存在后端，不会回显。" : "密钥只写入后端 .env，不写进配置文件，也不会回显。"}</small></label>
+          {hasKey && <small>留空表示不改已保存的密钥。</small>}</label>
       </> : <label className="form-label">模型连接<select aria-label="语音转写模型连接" value={config.provider} disabled={busy}
         onChange={(e) => setConfig({ ...config, provider: e.target.value })}>
         <option value="">请选择已配置的连接…</option>
         {connections.map((connection) => <option key={connection.id} value={connection.id}>{connection.label}{connection.has_key ? "" : "（缺少密钥）"}</option>)}
-      </select><small>该连接必须支持 /audio/transcriptions。</small></label>}
+      </select></label>}
       <label className="form-label">转写型号<input list="carme-voice-models" aria-label="语音转写型号" value={config.model} disabled={busy}
         placeholder="例如 FunAudioLLM/SenseVoiceSmall" onChange={(e) => setConfig({ ...config, model: e.target.value })} />
-        <datalist id="carme-voice-models">{suggested.map((id) => <option key={id} value={id} />)}</datalist>
-        <small>型号按接口文档填写，不必出现在「模型」列表里。</small></label>
+        <datalist id="carme-voice-models">{suggested.map((id) => <option key={id} value={id} />)}</datalist></label>
       <div className="voice-actions">
         <button type="button" className="secondary-button" disabled={busy} onClick={() => void toggleTest()}>
           {recording ? `停止并转写（${seconds}s）` : "录制测试"}
         </button>
-        <span className="form-help">录一段话，确认接口、密钥与型号可用。</span>
+        <span className="form-help">录一段话，确认能转写。</span>
       </div>
       {result && <p className="form-success" role="status"><Check size={16} />识别结果：{result}</p>}
     </>}
@@ -4271,6 +4885,7 @@ function SettingsDialog({
   onConnect,
   onModelsSaved,
   onMigrated,
+  onOpenLibrary,
 }: {
   stats: Stats;
   connected: boolean;
@@ -4278,19 +4893,21 @@ function SettingsDialog({
   onConnect: (token: string) => void;
   onModelsSaved: () => void;
   onMigrated: () => void;
+  onOpenLibrary: (target: "history" | "skills") => void;
 }) {
-  const [tab, setTab] = useState<SettingsTab>("general");
+  const [tab, setTab] = useState<SettingsTab>("account");
   const [value, setValue] = useState(token);
   const [sessions, setSessions] = useState<{ id: string; created_at: number; expires_at: number }[]>([]);
   const [sessionError, setSessionError] = useState("");
   useEffect(() => {
-    if (tab === "general" && connected) void api<{ sessions: typeof sessions }>("/sessions")
+    if (tab === "account" && connected) void api<{ sessions: typeof sessions }>("/sessions")
       .then((result) => setSessions(result.sessions)).catch((error) => setSessionError(error.message));
   }, [tab, connected]);
   return (
-    <Modal title="设置" onClose={onClose} wide>
+    <Modal title="设置" onClose={onClose} wide className="settings-modal">
       <div className="modal-body settings-form settings-layout">
         <nav className="settings-menubar" role="tablist" aria-label="设置分类">
+          <p className="settings-kicker" aria-hidden="true">设置</p>
           {SETTINGS_TABS.map(({ id, label, icon: Icon }) => (
             <button
               key={id}
@@ -4306,7 +4923,62 @@ function SettingsDialog({
           ))}
         </nav>
         <div className="settings-content" role="tabpanel">
-          {tab === "general" && <AppearanceSettings />}
+          {tab === "account" && (
+            <>
+              <div className="settings-section">
+                <h3><ShieldCheck size={17} />这台设备</h3>
+                <div className="status-line">
+                  <i className={`connection-dot ${connected ? "live" : ""}`} />
+                  {connected ? "已连接" : "等待连接"}
+                  <span>{ACCOUNT_NAME || location.host}</span>
+                  <button type="button" className="text-button" onClick={() => {
+                    void api("/session", undefined, "DELETE").then(() => ACCOUNT_NAME ? accountChanged() : location.reload());
+                  }}>退出</button>
+                </div>
+                {ACCOUNT_NAME ? <p className="form-help">聊天、文件和浏览器只属于这个账号。</p> : <>
+                  <form onSubmit={(e) => { e.preventDefault(); onConnect(value.trim()); setValue(""); }}>
+                    <label className="form-label">
+                      访问令牌
+                      <input type="password" value={value} autoComplete="off" placeholder="只用于这次配对，不会留在浏览器里" onChange={(e) => setValue(e.target.value)} />
+                    </label>
+                    <button type="submit" className="secondary-button">配对并连接</button>
+                  </form>
+                </>}
+                {sessions.length > 0 && <div className="session-list" aria-label="已配对设备">
+                  {sessions.map((session) => (
+                    <div className="session-row" key={session.id}>
+                      <span>
+                        <strong>……{session.id.slice(-8)}</strong>
+                        <small>{new Date(session.expires_at * 1000).toLocaleDateString()} 到期</small>
+                      </span>
+                      <button type="button" className="text-button" onClick={() => {
+                        void api(`/sessions/${session.id}`, undefined, "DELETE")
+                          .then(() => setSessions((items) => items.filter((item) => item.id !== session.id)))
+                          .catch((error) => setSessionError(error.message));
+                      }}>撤销</button>
+                    </div>
+                  ))}
+                </div>}
+                {sessionError && <p role="alert" className="form-error">{sessionError}</p>}
+              </div>
+              {ACCOUNT_NAME && <AccountPasswordSection />}
+              <div className="settings-section">
+                <h3>内容</h3>
+                <button type="button" className="settings-link-row" onClick={() => onOpenLibrary("history")}>
+                  <span>已归档和已删除</span>
+                  <ChevronRight size={16} />
+                </button>
+                <button type="button" className="settings-link-row" onClick={() => onOpenLibrary("skills")}>
+                  <span>管理 Skill</span>
+                  <ChevronRight size={16} />
+                </button>
+              </div>
+            </>
+          )}
+          {tab === "general" && <>
+            <AppearanceSettings />
+            <VoiceInputSettings />
+          </>}
           {tab === "models" && (
             <div className="settings-section">
               <h3>
@@ -4315,109 +4987,24 @@ function SettingsDialog({
               </h3>
               <LocalEngines />
               <ModelConnections onSaved={onModelsSaved} />
-              {stats.models?.mock_enabled && (
-                <p className="form-help">
-                  演示模型已启用，不代表真实模型链路通过。
-                </p>
-              )}
-              <p className="form-help">
-                对话和必要的工具输出会发送给你配置的云端模型。
-              </p>
+              <p className="form-help">对话会发给这里配置的云端模型。{stats.models?.mock_enabled ? "演示模型只用于测试。" : ""}</p>
             </div>
           )}
           {tab === "agents" && <AgentDefaults />}
           {tab === "migration" && <MigrationSettings onMigrated={onMigrated} />}
-          {tab === "notify" && (
-            <div className="settings-section">
-              <h3>
-                <Bell size={17} />
-                通知
-              </h3>
-              <p className="muted">
-                Web Push
-                尚未接入。当前在应用打开时实时同步进度，关闭页面后仍可再次进入查看任务结果。
-              </p>
-            </div>
-          )}
-          {tab === "access" && (
+          {tab === "remote" && (
             <>
-              <div className="settings-section">
-                <h3>
-                  <Globe size={17} />
-                  后端连接
-                </h3>
-                <div className="status-line">
-                  <i className={`connection-dot ${connected ? "live" : ""}`} />
-                  {connected ? "已连接" : "等待连接"}
-                  <span>{location.host}</span>
-                </div>
-                {ACCOUNT_NAME ? <p className="form-help">当前账号：{ACCOUNT_NAME}<br />此账号的聊天、文件和浏览器环境独立保存。</p> : <><form
-                  onSubmit={(e) => {
-                    e.preventDefault();
-                    onConnect(value.trim());
-                    setValue("");
-                  }}
-                >
-                  <label className="form-label">
-                    访问令牌
-                    <input
-                      type="password"
-                      value={value}
-                      autoComplete="off"
-                      placeholder="后端设置的 CARME_TOKEN"
-                      onChange={(e) => setValue(e.target.value)}
-                    />
-                  </label>
-                  <button type="submit" className="secondary-button">
-                    配对并连接
-                  </button>
-                </form>
-                <p className="form-help">访问令牌只用于本次配对，不保存在浏览器存储中。会话最长 7 天。</p></>}
-                <button type="button" className="text-button" onClick={() => {
-                  void api("/session", undefined, "DELETE").then(() => ACCOUNT_NAME ? accountChanged() : location.reload());
-                }}>退出此设备</button>
-                {sessions.length > 0 && <div aria-label="已配对设备会话"><p>有效设备会话（{sessions.length}）</p>
-                  {sessions.map((session) => <p key={session.id}>
-                    {session.id.slice(-8)} · {new Date(session.created_at * 1000).toLocaleString()} 配对 · {new Date(session.expires_at * 1000).toLocaleString()} 到期
-                    <button type="button" className="text-button" onClick={() => {
-                      void api(`/sessions/${session.id}`, undefined, "DELETE")
-                        .then(() => setSessions((items) => items.filter((item) => item.id !== session.id)))
-                        .catch((error) => setSessionError(error.message));
-                    }}>撤销会话</button>
-                  </p>)}
-                </div>}
-                {sessionError && <p role="alert" className="form-error">{sessionError}</p>}
-              </div>
-              {ACCOUNT_NAME && <AccountPasswordSection />}
-              <VoiceInputSettings />
               <CloudflareSettings />
               <div className="settings-section">
-                <h3>
-                  <Monitor size={17} />在 iPhone 与 Mac 上使用
-                </h3>
-                <p className="muted">
-                  iPhone：Safari 中打开，选择「分享 →
-                  添加到主屏幕」。Mac：使用浏览器访问同一个后端地址。
-                </p>
-                <p className="form-help">
-                  主屏幕离线外壳与推送能力需要安全的 HTTPS 连接。
-                  {!window.isSecureContext
-                    ? "当前连接不是安全上下文，暂不能注册离线应用。"
-                    : ""}
-                </p>
+                <h3><Monitor size={17} />手机与 Mac</h3>
+                <p className="form-help">iPhone 用 Safari 打开后，选「分享 → 添加到主屏幕」。Mac 用浏览器打开同一个地址。{window.isSecureContext ? "" : "当前不是安全连接，还不能装成离线应用。"}</p>
               </div>
             </>
           )}
           {tab === "about" && (
             <div className="settings-section">
-              <h3>
-                <CircleHelp size={17} />
-                关于 Carme
-              </h3>
-              <p className="muted">
-                Bot 的电脑暂定为 2018 MacBook，可以替换。后端保存
-                Bot、会话和任务；客户端负责聊天与查看。
-              </p>
+              <h3><CircleHelp size={17} />关于 Carme</h3>
+              <p className="form-help">后端保存 Bot、会话和任务。客户端用来聊天和查看。推送通知还没接入，页面打开时会同步进度。</p>
             </div>
           )}
         </div>
@@ -4640,27 +5227,25 @@ function AgentDefaults() {
     <div className="settings-section">
       <h3>
         <Users size={17} />
-        默认 Agent 与模型
+        新建 Bot 时使用
       </h3>
-      <p className="form-help">
-        一键新建 Bot 时不需要填写任何内容：名称、引擎、模型和工具都取自这里，描述可以创建后再编辑。
-      </p>
+      <p className="form-help">名称、引擎和模型取自这里。描述可以创建后再改。</p>
       <div className="form-grid">
         <label className="form-label">
-          默认名称
+          名称
           <input value={data.name} maxLength={80} onChange={(e) => setData({ ...data, name: e.target.value })} />
         </label>
         <label className="form-label">
-          默认描述
+          描述
           <input value={data.title} maxLength={160} placeholder="例如：通用助理" onChange={(e) => setData({ ...data, title: e.target.value })} />
         </label>
       </div>
       <label className="form-label">
-        默认角色指令
+        角色指令
         <textarea rows={4} value={data.prompt} onChange={(e) => setData({ ...data, prompt: e.target.value })} />
       </label>
       <label className="form-label">
-        默认 Agent（引擎）
+        引擎
         <select value={data.engine} onChange={(e) => setData({ ...data, engine: e.target.value as Agent["engine"] })}>
           {!engineOptions.length && <option value={data.engine}>{data.engine === "api" ? "Carme API 网关（暂无可用模型）" : `${data.engine} CLI（当前未连接）`}</option>}
           {engineOptions.map((engine) => (
@@ -4669,16 +5254,16 @@ function AgentDefaults() {
             </option>
           ))}
         </select>
-        <small>{data.engine === "api" ? "使用 Carme API 网关和已配置的模型连接。" : "使用 Carme 专用受管引擎。"}列表只显示当前已连接的 Agent。</small>
+
       </label>
       {data.engine !== "api" ? (
         <div className="form-grid">
           <label className="form-label">
-            默认 CLI 模型
+            CLI 模型
             <input value={data.engine_model} maxLength={200} autoCapitalize="off" autoCorrect="off" spellCheck={false} placeholder="由 Carme profile 显式指定模型" onChange={(e) => setData({ ...data, engine_model: e.target.value })} />
           </label>
           <label className="form-label">
-            默认 CLI 推理强度
+            推理强度
             <select value={data.engine_effort} onChange={(e) => setData({ ...data, engine_effort: e.target.value })}>
               <option value="">CLI 默认</option>
               {cliEffortOptions(data.engine).map((level) => <option key={level} value={level}>{level}</option>)}
@@ -4688,7 +5273,7 @@ function AgentDefaults() {
       ) : (
         <>
           <label className="form-label">
-            默认模型
+            模型
             <select value={data.model} onChange={(e) => setData({ ...data, model: e.target.value, effort: "" })}>
               <option value="">按模型档位自动选择</option>
               {data.model && !modelOptions.some((model) => model.ref === data.model) && <option value={data.model}>{data.model}（原配置，不在已配置列表中）</option>}
@@ -4696,11 +5281,11 @@ function AgentDefaults() {
                 ? modelOptionGroups.map((group) => <optgroup key={group.label} label={group.label}>{group.items.map(modelOption)}</optgroup>)
                 : modelOptionGroups.flatMap((group) => group.items.map(modelOption))}
             </select>
-            <small>{modelOptions.some((model) => model.available) ? `只列出已经配置好 API key 的模型（${modelOptions.filter((model) => model.available).length} 个）。` : "还没有可用模型：请先在「设置 → 模型」添加连接并验证 key。"}</small>
+            {!modelOptions.some((model) => model.available) && <small>还没有可用模型，先在「模型」里添加连接。</small>}
           </label>
           <div className="form-grid">
             <label className="form-label">
-              默认模型档位
+              模型档位
               <select value={data.tier} disabled={!!data.model} onChange={(e) => setData({ ...data, tier: e.target.value })}>
                 {Array.from(new Set(["reason", "balanced", "fast", data.tier])).map((tier) => (
                   <option key={tier} value={tier}>{tier}</option>
@@ -4708,7 +5293,7 @@ function AgentDefaults() {
               </select>
             </label>
             <label className="form-label">
-              默认推理强度
+              推理强度
               <select value={data.effort} disabled={!data.model} onChange={(e) => setData({ ...data, effort: e.target.value })}>
                 <option value="">连接默认{selectedModel?.effort ? `（${selectedModel.effort}）` : "（由模型决定）"}</option>
                 {data.effort && !selectedModel?.effort_options.includes(data.effort) && <option value={data.effort}>{data.effort}（原配置）</option>}
@@ -4719,9 +5304,9 @@ function AgentDefaults() {
         </>
       )}
       <label className="form-label">
-        默认可用工具
+        可用工具
         <input value={tools} placeholder="delegate, memory, browser" onChange={(e) => setTools(e.target.value)} />
-        <small>逗号分隔。会话附件读取和成果生成始终可用，各 Bot 之间可传递文本与文件附件。</small>
+        <small>用逗号分隔。附件读取和成果生成始终可用。</small>
       </label>
       <label className="checkbox-label">
         <input
@@ -4729,12 +5314,12 @@ function AgentDefaults() {
           checked={data.can_delegate}
           onChange={(e) => setData({ ...data, can_delegate: e.target.checked })}
         />
-        默认允许 Bot 之间互相委派（传递文本与文件附件）
+        允许 Bot 之间互相委派
       </label>
       <div className="form-actions">
         <button type="button" className="primary-button" disabled={busy} onClick={() => void save()}>
           {busy && <LoaderCircle size={16} className="spin" />}
-          保存默认值
+          保存
         </button>
       </div>
       {notice && <p className="form-success" role="status">{notice}</p>}
@@ -4830,6 +5415,8 @@ function CloudflareSettings() {
         </div>
         <p>{status?.message || "正在读取本机 cloudflared、命名隧道和鉴权配置。"}</p>
       </div>
+      <details className="settings-fold">
+        <summary>检查项与本地配置</summary>
       <div className="deployment-checks">
         <div><DeploymentCheck value={status?.cloudflared.installed} /><span>cloudflared</span><small>{status?.cloudflared.installed ? status.cloudflared.version || status.cloudflared.source : "未安装"}</small></div>
         <div><DeploymentCheck value={status?.config.origin_target_ok} /><span>Origin → 127.0.0.1:8899</span><small>{status?.config.origin_target_ok ? "目标正确" : "未确认"}</small></div>
@@ -4863,7 +5450,8 @@ function CloudflareSettings() {
           <button className="primary-button" type="submit" disabled={saving || busy}>{saving && <LoaderCircle size={16} className="spin" />}保存本地配置</button>
         </div>
       </form>
-      <details className="deployment-guide" open={status?.state !== "access_pending"}>
+      </details>
+      <details className="deployment-guide">
         <summary>上线步骤、协议诊断与 iPhone 安装</summary>
         <div className="deployment-guide-body">
           <ol>
@@ -4883,7 +5471,7 @@ function CloudflareSettings() {
             {command("./deploy/cloudflared/carme-tunnel.sh diagnose http2", "HTTP/2 诊断命令")}
             {command("./deploy/cloudflared/carme-tunnel.sh diagnose quic", "QUIC 诊断命令")}
           </div>
-          <p className="form-help">命令在 WBAI 目录执行。停止时脚本只识别自己记录、且命令行同时包含 cloudflared 与当前配置路径的进程，不会用全局 kill。日志默认写入活动目录；前端 SSE 不再把 CARME_TOKEN 放进 URL，避免令牌进入隧道请求路径。</p>
+          <p className="form-help">命令在 app 目录执行。停止时脚本只识别自己记录、且命令行同时包含 cloudflared 与当前配置路径的进程，不会用全局 kill。日志默认写入活动目录；前端 SSE 不再把 CARME_TOKEN 放进 URL，避免令牌进入隧道请求路径。</p>
           <p className="form-help">Cloudflare Access JWT 由 cloudflared 按本 ingress 的 `required/teamName/audTag` 校验；Carme 只接受自己的 Bearer/session 鉴权，不信任任意转发头或回环来源。Cloudflare 账号登录、域名、Access Allow 规则和 iPhone 安装仍必须由你本人完成。</p>
           <p className="form-help"><a href="https://one.dash.cloudflare.com/" target="_blank" rel="noreferrer">打开 Cloudflare One Dashboard</a></p>
         </div>
@@ -4964,9 +5552,9 @@ function LocalEngines() {
     <div className="status-line"><span>使用已登记的 Carme runtime profile。切换引擎保留聊天、角色和记忆，并继续执行相同权限检查。</span><button type="button" className="text-button" onClick={() => void refresh().catch((e) => setError(e.message))}><RefreshCw size={13} />重新检测</button></div>
     {execution && <div className="engine-connected" aria-label="执行组件状态">
       <strong>执行组件</strong>
-      <div className="engine-connected-chips">{([['Control', execution.control], ['Broker', execution.broker], ['Pi', execution.pi], ['Action', execution.action], ['Docker Browser', execution.browser || 'not_configured'], ['Mac Runner', execution.mac_runner]] as const).map(([name, state]) =>
+      <div className="engine-connected-chips">{([['Control', execution.control], ['Broker', execution.broker], ['Pi', execution.pi], ['Action', execution.action], [execution.web_route === 'Bot Linux Desktop' ? 'Bot 电脑中的浏览器' : 'Docker Browser', execution.browser || 'not_configured'], ['Mac Runner', execution.mac_runner]] as const).map(([name, state]) =>
         <span className="engine-chip" key={name}>{name} · {({ready: '已就绪', offline: '未连接', unavailable: '不可用', unverified: '未验收', not_paired: '未配对', image_missing: '镜像缺失'} as Record<string, string>)[state] || state}</span>)}</div>
-      <small>活动执行：{execution.active_jobs} · Worker 外部网络：{execution.worker_network === 'none' ? '禁用' : execution.worker_network}。Web 操作 → Docker Browser；真实 Mac 操作 → Mac Runner（需单独配对和授权）。</small>
+      <small>活动执行：{execution.active_jobs} · Worker 外部网络：{execution.worker_network === 'none' ? '禁用' : execution.worker_network}。Web 操作 → {execution.web_route === "Bot Linux Desktop" ? "Bot 电脑中的浏览器" : "Docker Browser"}；真实 Mac 操作 → Mac Runner（需单独配对和授权）。</small>
     </div>}
     {connectedEngines.length > 0 && <div className="engine-connected" role="status">
       <strong>已配置的受管引擎（{connectedEngines.length}）</strong>
@@ -5072,7 +5660,7 @@ type GroupBot = { id: string; name: string };
 type SkillRecord = {
   id: string; name: string; description: string; version: string; source: string;
   installed_at: number; enabled: boolean; files: string[]; file_count: number;
-  size: number; error: string;
+  size: number; error: string; shared: boolean;
 };
 type SkillCatalog = { skills: SkillRecord[]; root: string; enabled: number; bots: GroupBot[] };
 type McpTool = { name: string; description: string; registered: string };
@@ -5182,7 +5770,7 @@ function SkillPanel({ onAgentsChanged }: { onAgentsChanged: () => void }) {
   async function toggle(skill: SkillRecord) {
     setBusy(`toggle:${skill.id}`); setError(""); setNotice("");
     try {
-      const result = await api<{ ok: boolean; skill: SkillRecord; message: string }>(`/skills/${encodeURIComponent(skill.id)}`, { enabled: !skill.enabled }, "PATCH");
+      const result = await api<{ ok: boolean; skill: SkillRecord; message: string }>(`/skills/${encodeURIComponent(skill.id)}`, { enabled: !(skill.enabled && skill.shared) }, "PATCH");
       setSkills((previous) => previous.map((item) => item.id === skill.id ? result.skill : item));
       setNotice(result.message);
     } catch (e) { setError((e as Error).message); } finally { setBusy(""); }
@@ -5230,7 +5818,7 @@ function SkillPanel({ onAgentsChanged }: { onAgentsChanged: () => void }) {
   const valueLabel = form.source === "path" ? "本机路径" : form.source === "url" ? "SKILL.md 地址" : "GitHub 仓库";
   return <div className="model-connections settings-form">
     <div className="ext-panel-head">
-      <p className="muted">已安装 {skills.length} 个技能 · 目录 <span className="ext-mono">{root || "读取中…"}</span></p>
+      <p className="muted">账号共享技能 · 已安装 {skills.length} 个 · 目录 <span className="ext-mono">{root || "读取中…"}</span></p>
       <button type="button" className="secondary-button" disabled={!!busy} onClick={() => void rescan()}>
         {busy === "reload" ? <LoaderCircle className="spin" size={16} /> : <RefreshCw size={16} />}重新扫描
       </button>
@@ -5240,6 +5828,7 @@ function SkillPanel({ onAgentsChanged }: { onAgentsChanged: () => void }) {
         <div className="ext-card-head">
           <strong>{skill.name || skill.id}</strong>
           {!!skill.version && <span className="tag ext-tag">{skill.version}</span>}
+          {skill.shared && <span className="tag ext-tag">账号共享</span>}
           {!!skill.error && <span className="ext-status error">不可用</span>}
           {!skill.enabled && !skill.error && <span className="ext-status disabled">已停用</span>}
         </div>
@@ -5247,7 +5836,7 @@ function SkillPanel({ onAgentsChanged }: { onAgentsChanged: () => void }) {
         <small className="ext-meta">{skill.id} · {skill.file_count} 个文件 · {formatSize(skill.size)} · {skill.source || "来源未知"} · 安装于 {formatTime(skill.installed_at, true)}</small>
         {!!skill.error && <div className="ext-error" role="alert">{skill.error}</div>}
         <label className="check-label">
-          <input type="checkbox" aria-label={`启用技能 ${skill.name || skill.id}`} checked={skill.enabled} disabled={!!busy || !!skill.error} onChange={() => void toggle(skill)} />启用
+          <input type="checkbox" aria-label={`全账号启用技能 ${skill.name || skill.id}`} checked={skill.enabled && skill.shared} disabled={!!busy || !!skill.error} onChange={() => void toggle(skill)} />全账号启用
         </label>
         <button type="button" className="text-button" disabled={busy === `doc:${skill.id}`} onClick={() => void showDoc(skill)}>
           {busy === `doc:${skill.id}` ? <LoaderCircle className="spin" size={14} /> : <FileText size={14} />}{open === skill.id ? "收起说明" : "查看说明"}
@@ -5258,14 +5847,14 @@ function SkillPanel({ onAgentsChanged }: { onAgentsChanged: () => void }) {
       </div>
       <div className="model-connection-actions">
         <button type="button" className="text-button danger-text" disabled={!!busy} onClick={() => removing === skill.id ? void remove(skill.id) : setRemoving(skill.id)}>
-          <Trash2 size={14} />{removing === skill.id ? "确认删除" : "删除"}
+          <Trash2 size={14} />{removing === skill.id ? "确认全账号卸载" : "全账号卸载"}
         </button>
       </div>
     </div>)}
     {loaded && !skills.length && <p className="muted">技能（Skill）就是一个带 SKILL.md 的目录：用法写在 SKILL.md 里，脚本和模板放在同一个目录下，Bot 需要时会先读说明再使用。现在还没有安装任何技能，用下面的表单装一个。</p>}
     <form className="settings-form ext-form" onSubmit={install}>
       <strong>安装技能</strong>
-      <p className="form-help">技能会保存到后端目录 <span className="ext-mono">{root || "skills"}</span>。可以从 Markdown、本机路径、网址或 GitHub 仓库安装；同名技能会生成新的 id（例如 pdf-2），不会覆盖已有技能。</p>
+      <p className="form-help">技能会保存到后端目录 <span className="ext-mono">{root || "skills"}</span>。可以从 Markdown、本机路径、网址或 GitHub 仓库安装；安装一次，现有和新建 Bot 均可使用；完整内容相同则复用，同名但内容不同的版本会单独保留。</p>
       <label className="form-label">来源
         <select value={form.source} disabled={!!busy} onChange={(e) => setForm({ ...form, source: e.target.value as SkillSource })}>
           {SKILL_SOURCES.map(([id, label]) => <option key={id} value={id}>{label}</option>)}
@@ -5285,7 +5874,7 @@ function SkillPanel({ onAgentsChanged }: { onAgentsChanged: () => void }) {
     </form>
     <SkillLearning bots={bots} installed={skills} />
     <ToolGroupHint bots={bots} group="skill" onAgentsChanged={onAgentsChanged} />
-    <p className="form-help">工具分组只开放读取入口。每个 Bot 还需单独授权固定 Skill 版本。</p>
+    <p className="form-help">账号共享只共享 Skill 说明、脚本和版本，不共享聊天、浏览器或私人文件。聊天中删除默认仅停用当前 Bot；这里卸载会影响全账号。</p>
     {!!notice && <p className="form-success" role="status"><Check size={16} />{notice}</p>}
     {!!error && <p className="form-error" role="alert">{error}</p>}
   </div>;
@@ -5443,12 +6032,14 @@ function McpPanel({ onAgentsChanged }: { onAgentsChanged: () => void }) {
           <button type="button" className="text-button" onClick={() => setExpanded(expanded === server.id ? "" : server.id)}>
             <ChevronRight className={expanded === server.id ? "ext-open" : ""} size={14} />{server.tool_count} 个工具
           </button>
-          {expanded === server.id && <ul className="connection-model-list">
+          <div className={`ext-tools${expanded === server.id ? "" : " collapsed"}`} aria-hidden={expanded !== server.id}>
+            <ul className="connection-model-list">
             {server.tools.map((tool) => <li key={tool.registered || tool.name}>
               <span><code>{tool.registered || tool.name}</code>{tool.registered && tool.name && tool.registered !== tool.name ? ` · ${tool.name}` : ""}<small>{tool.description}</small></span>
             </li>)}
             {!server.tools.length && <li><span>这个 Server 没有提供任何工具</span></li>}
-          </ul>}
+          </ul>
+          </div>
           {!!(server.server_info || server.protocol) && <small className="ext-meta">{server.server_info}{server.server_info && server.protocol ? " · " : ""}{server.protocol}</small>}
         </> : server.tool_count > 0 ? <small className="ext-meta">上次连接时注册了 {server.tool_count} 个工具</small> : null}
         <label className="check-label">
@@ -5581,8 +6172,9 @@ function McpPanel({ onAgentsChanged }: { onAgentsChanged: () => void }) {
   </form>;
 }
 
-function ConversationRow({conversation: c, name, agent, selected, onSelect, onMenu}: {
-  conversation: Conversation; name: string; agent?: Agent; selected: boolean;
+function ConversationRow({conversation: c, name, agent, members, selected, presence = "idle", action = "", onSelect, onMenu}: {
+  conversation: Conversation; name: string; agent?: Agent; members: (Agent | undefined)[]; selected: boolean;
+  presence?: Presence; action?: string;
   onSelect: () => void; onMenu: (x: number, y: number) => void;
 }) {
   const timer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
@@ -5597,9 +6189,15 @@ function ConversationRow({conversation: c, name, agent, selected, onSelect, onMe
       onPointerDown={(e) => {held.current=false; if(e.pointerType !== "touch") return; origin.current={x:e.clientX,y:e.clientY}; clear(); timer.current=setTimeout(() => {held.current=true; onMenu(origin.current.x,origin.current.y);},550);}}
       onPointerMove={(e) => {if(Math.hypot(e.clientX-origin.current.x,e.clientY-origin.current.y)>10) clear();}}
       onPointerUp={clear} onPointerCancel={clear}>
-      <span className="conversation-avatar"><Avatar agent={agent} group={c.agent_ids.length>1} working={!!c.active_agent_ids?.length}/>{!!c.unread && <i className="unread-dot" aria-label="未读" />}</span>
-      <span className="conversation-copy"><span className="conversation-title"><span>{name}</span><time>{formatTime(c.updated_at)}</time></span>
-      <span className="conversation-preview">{brief(c.last_message || "开始聊点什么吧")}</span></span>
+      <span className="conversation-avatar"><Avatar agent={agent} group={isGroupChat(c)} members={members} visitorCount={c.visitor_count} presence={presence} action={action}/>{!!c.unread && <i className="unread-dot" aria-label="未读" />}</span>
+      <span className="conversation-copy">
+        <span className="conversation-title">
+          <span className="conversation-name">{name}</span>
+          {(() => { const role = isGroupChat(c) ? `${c.agent_ids.length + (c.visitor_count || 0) + 1} 位成员（含你）` : agent?.title?.trim(); return role ? <span className="conversation-role">{role}</span> : null; })()}
+          <time>{listTime(c.updated_at)}</time>
+        </span>
+        <span className="conversation-preview">{brief(c.last_message || "开始聊点什么吧")}</span>
+      </span>
     </button>
     <button className="conversation-more icon-button" aria-label={`${name} 更多操作`} aria-haspopup="menu" onClick={(e) => {const r=e.currentTarget.getBoundingClientRect(); onMenu(r.right,r.bottom);}}><MoreHorizontal size={18}/></button>
   </div>;
@@ -5608,22 +6206,32 @@ function ConversationRow({conversation: c, name, agent, selected, onSelect, onMe
 function ChatContextMenu({menu, onClose, onAction}: {menu: {conversation: Conversation; x: number; y: number}; onClose: () => void; onAction: (action: ChatAction) => void}) {
   const element = useRef<HTMLDivElement>(null);
   const [position,setPosition] = useState({left:menu.x,top:menu.y});
+  const closingRef = useRef(false);
+  const [closing,setClosing] = useState(false);
+  const closeTimer = useRef<ReturnType<typeof setTimeout>|undefined>(undefined);
+  /* 两拍关闭：先播 menu-out 淡出，130ms 后卸载；期间忽略重复触发 */
+  function requestClose() {
+    if (closingRef.current) return;
+    closingRef.current = true;
+    setClosing(true);
+    closeTimer.current = setTimeout(() => onClose(), 130);
+  }
   useLayoutEffect(() => {
     const rect=element.current!.getBoundingClientRect();
     setPosition({left:Math.max(12,Math.min(menu.x,window.innerWidth-rect.width-12)),top:Math.max(12,Math.min(menu.y,window.innerHeight-rect.height-12))});
     element.current?.querySelector('button')?.focus();
   },[menu.x,menu.y]);
   useEffect(() => {
-    const dismiss=(e:PointerEvent) => {if (!element.current?.contains(e.target as globalThis.Node)) onClose();};
-    const resize=() => onClose();
+    const dismiss=(e:PointerEvent) => {if (closingRef.current) return; if (!element.current?.contains(e.target as globalThis.Node)) requestClose();};
+    const resize=() => requestClose();
     document.addEventListener("pointerdown",dismiss); window.addEventListener("resize",resize);
-    return () => {document.removeEventListener("pointerdown",dismiss);window.removeEventListener("resize",resize);};
+    return () => {document.removeEventListener("pointerdown",dismiss);window.removeEventListener("resize",resize);clearTimeout(closeTimer.current);};
   },[onClose]);
-  const c=menu.conversation, single=c.agent_ids.length===1;
+  const c=menu.conversation, single=!isGroupChat(c)&&c.agent_ids.length===1;
   const row=(action:ChatAction, label:string, icon:ReactNode, danger=false) => <button role="menuitem" className={danger?"danger-text":""} onClick={() => onAction(action)}>{icon}<span>{label}</span></button>;
-  return <div ref={element} role="menu" aria-label="Bot 操作" className="chat-context-menu" style={position}
+  return <div ref={element} role="menu" aria-label="Bot 操作" className={`chat-context-menu${closing?" closing":""}`} style={position}
     onKeyDown={(e) => {const buttons=Array.from(element.current!.querySelectorAll('button')); const index=buttons.indexOf(document.activeElement as HTMLButtonElement);
-      if(e.key==='Escape'||e.key==='Tab') {onClose(); return;}
+      if(e.key==='Escape'||e.key==='Tab') {requestClose(); return;}
       if(['ArrowDown','ArrowUp','Home','End'].includes(e.key)) {e.preventDefault(); buttons[e.key==='Home'?0:e.key==='End'?buttons.length-1:(index+(e.key==='ArrowDown'?1:buttons.length-1))%buttons.length]?.focus();}}}>
     {row("pin",c.pinned_at?"取消置顶":"置顶",c.pinned_at?<PinOff size={21}/>:<Pin size={21}/>)}
     {row("folder","移至新分组",<FolderPlus size={21}/>)}
@@ -5641,27 +6249,52 @@ function ChatActionDialog({action, name, folders, onClose, onApply}: {action:Cha
   const [value,setValue]=useState(action.kind==='rename'?name:'');
   const [folder,setFolder]=useState('__new');
   const [busy,setBusy]=useState(false),[error,setError]=useState('');
-  const title=action.kind==='rename'?(action.conversation.agent_ids.length===1?'重命名 Bot':'重命名群聊'):action.kind==='folder'?'移至分组':'删除对话';
-  async function submit(e:FormEvent) {e.preventDefault();setBusy(true);setError('');try {await onApply(action.kind==='folder'&&folder!=='__new'?folder:value.trim());}catch(e){setError((e as Error).message);}finally{setBusy(false);}}
-  return <Modal title={title} onClose={onClose}><form className="modal-body settings-form" onSubmit={submit}>
+  const requestClose = onClose;
+  const title=action.kind==='rename'?(!isGroupChat(action.conversation)&&action.conversation.agent_ids.length===1?'重命名 Bot':'重命名群聊'):action.kind==='folder'?'移至分组':'删除对话';
+  async function submit(e:FormEvent) {e.preventDefault();setBusy(true);setError('');try {await onApply(action.kind==='folder'&&folder!=='__new'?folder:value.trim());requestClose();}catch(e){setError((e as Error).message);}finally{setBusy(false);}}
+  return <Modal title={title} onClose={onClose} closeDisabled={busy}><form className="modal-body settings-form" onSubmit={submit}>
     {action.kind==='delete'?<p className="form-help">将「{name}」的这段对话移到最近删除。Bot 的角色、记忆和其他对话会保留，可在「隐藏与最近删除」中恢复。</p>:<>
       {action.kind==='folder'&&<label className="form-label">分组<select value={folder} onChange={(e)=>setFolder(e.target.value)}><option value="__new">创建新分组</option><option value="">移出分组</option>{folders.map((f)=><option key={f} value={f}>{f}</option>)}</select></label>}
       {(action.kind==='rename'||folder==='__new')&&<label className="form-label">{action.kind==='rename'?'名称':'新分组名称'}<input autoFocus required value={value} maxLength={action.kind==='rename'?80:60} onChange={(e)=>setValue(e.target.value)}/></label>}
-      {action.kind==='rename'&&<p className="form-help">修改名称会保留模型、角色指令、头像、聊天和记忆。</p>}
+      {action.kind==='rename'&&<p className="form-help">{isGroupChat(action.conversation) ? '修改群名不会改变成员、聊天记录和记忆。' : '修改名称会保留模型、角色指令、头像、聊天和记忆。'}</p>}
     </>}
     {error&&<p className="form-error" role="alert">{error}</p>}
-    <div className="form-actions"><button type="button" className="secondary-button" onClick={onClose} disabled={busy}>取消</button><button type="submit" className={`primary-button ${action.kind==='delete'?'danger-button':''}`} disabled={busy || (action.kind!=='delete'&&(action.kind==='rename'||folder==='__new')&&!value.trim())}>{busy?<LoaderCircle size={16} className="spin"/>:action.kind==='delete'?'移到最近删除':'保存'}</button></div>
+    <div className="form-actions"><button type="button" className="secondary-button" onClick={requestClose} disabled={busy}>取消</button><button type="submit" className={`primary-button ${action.kind==='delete'?'danger-button':''}`} disabled={busy || (action.kind!=='delete'&&(action.kind==='rename'||folder==='__new')&&!value.trim())}>{busy?<LoaderCircle size={16} className="spin"/>:action.kind==='delete'?'移到最近删除':'保存'}</button></div>
   </form></Modal>;
 }
 
 function HiddenChatsDialog({agents,onClose,onRestored}: {agents:Agent[];onClose:()=>void;onRestored:()=>Promise<unknown>}) {
   const [view,setView]=useState<'hidden'|'deleted'>('hidden'),[rows,setRows]=useState<Conversation[]>([]),[busy,setBusy]=useState(''),[error,setError]=useState('');
-  const refresh=useCallback(async()=>{const result=await api<{conversations:Conversation[]}>(`/conversations?view=${view}`);setRows(result.conversations);},[view]);
-  useEffect(()=>{setRows([]);void refresh().catch((e)=>setError(e.message));},[refresh]);
-  return <Modal title="隐藏与最近删除" onClose={onClose}><div className="modal-body settings-form">
-    <div className="history-tabs" role="tablist" aria-label="恢复聊天">{(['hidden','deleted'] as const).map((v)=><button key={v} role="tab" aria-selected={view===v} onClick={()=>setView(v)}>{v==='hidden'?'已隐藏':'最近删除'}</button>)}</div>
-    {rows.map((c)=><div className="history-chat" key={c.id}><Avatar agent={agents.find((a)=>a.id===c.agent_ids[0])} group={c.agent_ids.length>1}/><div><strong>{c.agent_ids.length===1?agents.find((a)=>a.id===c.agent_ids[0])?.name||c.title:c.title}</strong><small>{brief(c.last_message||'暂无消息')}</small></div><button className="secondary-button" disabled={!!busy} onClick={async()=>{setBusy(c.id);setError('');try{await api(`/conversations/${c.id}`,view==='hidden'?{hidden:false}:{deleted:false},'PATCH');await refresh();await onRestored();}catch(e){setError((e as Error).message);}finally{setBusy('');}}}>{busy===c.id?'恢复中…':'恢复'}</button></div>)}
-    {!rows.length&&<p className="muted">{view==='hidden'?'没有隐藏的聊天':'最近删除为空'}</p>}
+  const [confirmIds,setConfirmIds]=useState<string[]|null>(null),[loading,setLoading]=useState(false),[notice,setNotice]=useState('');
+  const requestVersion=useRef(0);
+  const refresh=useCallback(async()=>{
+    const version=++requestVersion.current;setLoading(true);
+    try{const result=await api<{conversations:Conversation[]}>(`/conversations?view=${view}`);if(version===requestVersion.current)setRows(result.conversations);}
+    finally{if(version===requestVersion.current)setLoading(false);}
+  },[view]);
+  useEffect(()=>{setRows([]);setConfirmIds(null);setError('');setNotice('');void refresh().catch((e)=>setError(e.message));return()=>{requestVersion.current++;};},[refresh]);
+  const purge=async()=>{
+    if(!confirmIds||busy)return;
+    setBusy('purge');setError('');
+    try{
+      const result=await api<{deleted_count:number;file_cleanup_pending:number}>('/conversations/purge',{conversation_ids:confirmIds});
+      setConfirmIds(null);setNotice(`已永久清空 ${result.deleted_count} 个聊天。${result.file_cleanup_pending?'部分附件文件清理失败，请联系管理员检查存储权限。':''}`);
+      await refresh();await onRestored();
+    }catch(e){setError((e as Error).message);setConfirmIds(null);await refresh().catch(()=>{});}
+    finally{setBusy('');}
+  };
+  return <Modal title="隐藏与最近删除" onClose={onClose} closeDisabled={busy!==""}><div className="modal-body settings-form">
+    <div className="history-toolbar"><div className="history-tabs" role="tablist" aria-label="恢复聊天">{(['hidden','deleted'] as const).map((v)=><button key={v} role="tab" aria-selected={view===v} disabled={!!busy} onClick={()=>setView(v)}>{v==='hidden'?'已隐藏':'最近删除'}</button>)}</div>
+      {view==='deleted'&&rows.length>0&&!confirmIds&&<button className="text-button history-clear" disabled={!!busy||loading} onClick={()=>{setConfirmIds(rows.map(c=>c.id));setError('');setNotice('');}}>清空已删除</button>}</div>
+    {confirmIds&&<div className="history-purge-confirm" role="alert">
+      <strong>永久清空这 {confirmIds.length} 个聊天？</strong>
+      <p>聊天记录、关联任务记录和附件将从当前工作空间永久删除，无法恢复。Bot 配置、记忆、已安装的软件和 Skill 会保留。</p>
+      <div className="form-actions"><button className="secondary-button" disabled={!!busy} onClick={()=>setConfirmIds(null)}>取消</button><button className="primary-button danger-button" disabled={!!busy} onClick={()=>void purge()}>{busy==='purge'?'清空中…':'永久清空'}</button></div>
+    </div>}
+    {rows.map((c)=><div className="history-chat" key={c.id}><Avatar agent={agents.find((a)=>a.id===c.agent_ids[0])} group={isGroupChat(c)} members={c.agent_ids.map((id)=>agents.find((a)=>a.id===id))} visitorCount={c.visitor_count}/><div><strong>{!isGroupChat(c)&&c.agent_ids.length===1?agents.find((a)=>a.id===c.agent_ids[0])?.name||c.title:c.title}</strong><small>{brief(c.last_message||'暂无消息')}</small></div><button className="secondary-button" disabled={!!busy||!!confirmIds||loading} onClick={async()=>{setBusy(c.id);setError('');setNotice('');try{await api(`/conversations/${c.id}`,view==='hidden'?{hidden:false}:{deleted:false},'PATCH');await refresh();await onRestored();}catch(e){setError((e as Error).message);}finally{setBusy('');}}}>{busy===c.id?'恢复中…':'恢复'}</button></div>)}
+    {loading&&!rows.length&&<div className="sk-stack history-skeleton" role="status" aria-label="加载中"><div className="conv-skeleton"><span className="skeleton sk-avatar-sm"/><div className="sk-stack"><span className="skeleton" style={{width:"46%"}}/><span className="skeleton" style={{width:"72%",opacity:0.75}}/></div></div><div className="conv-skeleton"><span className="skeleton sk-avatar-sm"/><div className="sk-stack"><span className="skeleton" style={{width:"38%"}}/><span className="skeleton" style={{width:"64%",opacity:0.75}}/></div></div></div>}
+    {!loading&&!rows.length&&<p className="muted">{view==='hidden'?'没有隐藏的聊天':'最近删除为空'}</p>}
+    {notice&&<p className="form-help" role="status">{notice}</p>}
     {error&&<p className="form-error" role="alert">{error}</p>}
     <p className="form-help">恢复后重新出现在侧边栏，聊天记录、任务和 Bot 记忆保持不变。</p>
   </div></Modal>;
@@ -5695,11 +6328,11 @@ function AppearanceSettings() {
       {proportional.length>0&&<optgroup label={`系统字体（${proportional.length}）`}>{options(proportional)}</optgroup>}
       {monospaceFonts.length>0&&<optgroup label={`等宽字体（${monospaceFonts.length}）`}>{options(monospaceFonts)}</optgroup>}
       {!fonts.length&&<option value="" disabled>{error?"读不到后端字体列表，先使用内置字体":"正在读取运行 Carme 的系统的字体…"}</option>}
-    </select><small>列表来自运行 Carme 的后端；本机（或手机）没装的字体会自动落到替代字体。</small></label>
+    </select></label>
     <label className="form-label">基准字号 <output>{value.size} px</output><input type="range" aria-label="界面字号" min="14" max="22" step="1" value={value.size} onChange={(e)=>update({...value,size:Number(e.target.value)})}/></label></div>
     {fonts.length>11&&<label className="search-box appearance-font-search"><Search size={16}/><input aria-label="搜索系统字体" value={search} onChange={(e)=>setSearch(e.target.value)} placeholder={`在 ${fonts.length} 种系统字体中搜索`}/></label>}
     <p className="appearance-preview">Carme · 让 Bot 帮你处理日常工作。<br/>文字大小、菜单和聊天将同步调整。</p>
-    <div className="appearance-help"><small>{fonts.length?`已读取 ${fonts.length} 种系统字体${source==="fontconfig"?"（读自 fontconfig）":source==="builtin"?"（系统字体不可读，使用内置清单）":""}。立即生效，保存在此设备。`:error?`无法读取后端字体列表：${error}。当前使用内置字体。`:"正在读取运行 Carme 的系统的字体。"}</small>
+    <div className="appearance-help"><small>{error ? "读不到字体列表，先用内置字体。" : "马上生效，只保存在这台设备。"}</small>
       <span className="appearance-help-actions">{(fonts.length>0||!!error)&&<button className="text-button" type="button" disabled={busy} onClick={async()=>{setBusy(true);setError("");try{await load(true);setSearch("");}catch(e){setError((e as Error).message);}finally{setBusy(false);}}}><RefreshCw size={13}/>{busy?"重新检测中…":"重新检测"}</button>}<button className="text-button" type="button" onClick={()=>update({family:'system',size:16})}>恢复默认</button></span></div>
   </div>;
 }
@@ -5707,7 +6340,7 @@ function AppearanceSettings() {
 function ModelRoutingSettings({settings,onSaved}:{settings:ModelSettings;onSaved:()=>Promise<void>}) {
   const [tiers,setTiers]=useState(settings.tiers||{}),[mock,setMock]=useState(!!settings.allow_mock),[busy,setBusy]=useState(false),[notice,setNotice]=useState(''),[error,setError]=useState('');
   return <form className="model-routing settings-form" onSubmit={async(e)=>{e.preventDefault();setBusy(true);setError('');setNotice('');try{await api('/models/routing',{tiers,allow_mock:mock},'PATCH');setNotice('团队默认模型已保存。');await onSaved();}catch(e){setError((e as Error).message);}finally{setBusy(false);}}}>
-    <strong>团队默认模型</strong><p className="form-help">未单独指定模型的 Bot 使用对应档位。已经单独选择模型的 Bot 保持原设置。</p>
+    <strong>团队默认模型</strong><p className="form-help">没单独选模型的 Bot 用这里的档位。</p>
     {Object.entries(tiers).map(([tier,refs])=><label className="form-label" key={tier}>{({balanced:'标准',cheap:'轻量',reason:'推理'} as Record<string,string>)[tier]||tier}档位<select aria-label={`${tier} 默认模型`} value={refs[0]||''} onChange={(e)=>setTiers({...tiers,[tier]:[e.target.value]})}><option value="" disabled>请选择已配置模型</option>{settings.models.filter((m)=>m.available||refs.includes(m.ref)).map((m)=><option key={m.ref} value={m.ref} disabled={m.api_type==='mock'&&!mock}>{m.provider_label} · {m.id}{m.api_type==='mock'?'（演示）':''}</option>)}</select>{refs.length>1&&<small>当前有 {refs.length} 个顺序候选；更改此项会将该档位设为单个模型。</small>}</label>)}
     <label className="check-label"><input type="checkbox" checked={mock} onChange={(e)=>setMock(e.target.checked)}/>允许演示模型（仅用于测试）</label>
     <button className="secondary-button" type="submit" disabled={busy}>{busy?'保存中…':'保存默认模型'}</button>
@@ -5746,26 +6379,27 @@ function TaskEvidence({ taskId, title }: { taskId: string; title: string }) {
 }
 
 type LearningCandidate = { id: string; skill_id: string; revision: string; source_task_id: string; status: string; test_task_id: string | null };
-type LearningState = { candidates: LearningCandidate[]; skill_grants: Record<string, Record<string, string>>; approved_versions: Record<string, string[]> };
+type LearningState = { candidates: LearningCandidate[]; skill_grants: Record<string, Record<string, string>>; disabled_by_bot: Record<string, string[]>; approved_versions: Record<string, string[]> };
 function SkillLearning({ bots, installed }: { bots: GroupBot[]; installed: SkillRecord[] }) {
   const [state, setState] = useState<LearningState | null>(null); const [error, setError] = useState(""); const [busy, setBusy] = useState(false);
   const [source, setSource] = useState(""); const [name, setName] = useState(""); const [document, setDocument] = useState(""); const [privateNames, setPrivateNames] = useState("");
-  const [bot, setBot] = useState(""); const [skill, setSkill] = useState(""); const [revision, setRevision] = useState("");
+  const [bot, setBot] = useState("*"); const [skill, setSkill] = useState(""); const [revision, setRevision] = useState("");
   const [candidateReview, setCandidateReview] = useState<{ id: string; files: Record<string, string> } | null>(null);
   const [candidateId, setCandidateId] = useState(""); const [testTask, setTestTask] = useState(""); const [reviewed, setReviewed] = useState(false);
   const [conversation, setConversation] = useState(""); const [inputIds, setInputIds] = useState(""); const [goal, setGoal] = useState(""); const [filename, setFilename] = useState("report.pdf"); const [requiredText, setRequiredText] = useState("");
   const load = useCallback(async () => setState(await api<LearningState>("/learning")), []);
   async function action(path: string, body: object) { setBusy(true); setError(""); try { const result = await api<Record<string, unknown>>(path, body); await load(); return result; } catch(e) { setError((e as Error).message); } finally { setBusy(false); } }
   const candidate = state?.candidates.find(c => c.id === candidateId);
+  const currentRevision = state?.disabled_by_bot?.[bot]?.includes(skill) ? undefined : state?.skill_grants[bot]?.[skill] || state?.skill_grants["*"]?.[skill];
   return <details className="settings-form ext-form"><summary onClick={() => { if (!state) void load().catch(e => setError((e as Error).message)); }}>版本授权与 Skill 学习</summary>
     <p className="form-help">先验收并确认源任务，再生成脱敏候选。新输入实测并获确认后，才可发布给选定 Bot。</p>
-    <label className="form-label">授权 Bot<select value={bot} onChange={e => setBot(e.target.value)}><option value="">请选择</option>{bots.map(b => <option key={b.id} value={b.id}>{b.name}</option>)}</select></label>
+    <label className="form-label">授权范围<select value={bot} onChange={e => setBot(e.target.value)}><option value="*">全账号（含新 Bot）</option>{bots.map(b => <option key={b.id} value={b.id}>{b.name}</option>)}</select></label>
     <label className="form-label">已安装技能<select value={skill} onChange={e => { setSkill(e.target.value); setRevision(""); }}><option value="">请选择</option>{installed.map(s => <option value={s.id} key={s.id}>{s.name}</option>)}</select></label>
     <button type="button" disabled={busy || !skill} onClick={() => void action(`/skills/${encodeURIComponent(skill)}/snapshot`, {}).then(r => { if (r) setRevision(String(r.revision)); })}>生成待授权版本</button>
     <label className="form-label">版本（可选旧版本回滚）<input value={revision} onChange={e => setRevision(e.target.value)} list="skill-approved-versions" /><datalist id="skill-approved-versions">{(state?.approved_versions[skill] || []).map(v => <option key={v} value={v} />)}</datalist></label>
-    <p className="form-help">当前授权：{state?.skill_grants[bot]?.[skill] || "无"}</p>
+    <p className="form-help">当前授权：{currentRevision || "无"}</p>
     <button type="button" disabled={busy || !bot || !skill || !revision} onClick={() => void action("/skill-grants", { bot_id: bot, skill_id: skill, revision })}>授权所选版本 / 回滚</button>
-    <button type="button" disabled={busy || !state?.skill_grants[bot]?.[skill]} onClick={() => void action("/skill-grants", { bot_id: bot, skill_id: skill, revision: state?.skill_grants[bot]?.[skill], revoke: true })}>撤销此授权</button>
+    <button type="button" disabled={busy || !currentRevision} onClick={() => void action("/skill-grants", { bot_id: bot, skill_id: skill, revision: currentRevision, revoke: true })}>撤销此授权</button>
     <label className="form-label">已认可的源任务 ID<input value={source} onChange={e => setSource(e.target.value)} /></label>
     <label className="form-label">候选名称<input value={name} onChange={e => setName(e.target.value)} /></label>
     <label className="form-label">候选说明<textarea rows={6} value={document} onChange={e => setDocument(e.target.value)} /></label>
@@ -5781,7 +6415,7 @@ function SkillLearning({ bots, installed }: { bots: GroupBot[]; installed: Skill
       <label className="form-label">测试任务<textarea rows={2} value={goal} onChange={e => setGoal(e.target.value)} placeholder={`使用 ${candidate.skill_id} 处理新输入`} /></label>
       <label className="form-label">测试成果文件名<input value={filename} onChange={e => setFilename(e.target.value)} /></label>
       <label className="form-label">成果必须包含的文字<input value={requiredText} onChange={e => setRequiredText(e.target.value)} /></label>
-      <button type="button" disabled={busy || !bot || !conversation || !inputIds || !goal || !filename || !requiredText} onClick={() => void action(`/skill-candidates/${candidate.id}/test`, { conversation_id: conversation, agent_id: bot, goal, envelope: { input_artifact_ids: inputIds.split(",").map(s => s.trim()).filter(Boolean), expected_outputs: [filename], acceptance_checks: [{ output: filename, check: { kind: "text_contains", text: requiredText } }] } }).then(r => { if (r) setTestTask(String(r.task_id)); })}>在隔离容器用新输入测试</button>
+      <button type="button" disabled={busy || !bot || bot === "*" || !conversation || !inputIds || !goal || !filename || !requiredText} onClick={() => void action(`/skill-candidates/${candidate.id}/test`, { conversation_id: conversation, agent_id: bot, goal, envelope: { input_artifact_ids: inputIds.split(",").map(s => s.trim()).filter(Boolean), expected_outputs: [filename], acceptance_checks: [{ output: filename, check: { kind: "text_contains", text: requiredText } }] } }).then(r => { if (r) setTestTask(String(r.task_id)); })}>在隔离容器用新输入测试</button>
       <label className="form-label">测试任务 ID<input value={testTask} onChange={e => setTestTask(e.target.value)} /></label>
       {testTask && <TaskEvidence taskId={testTask} title="候选实测" />}
       <label className="check-label"><input type="checkbox" checked={reviewed} disabled={candidateReview?.id !== candidate.id} onChange={e => setReviewed(e.target.checked)} />已查看候选全文、来源及实测结果，确认无私人信息</label>
@@ -5805,3 +6439,111 @@ function McpGrants({ bots, servers }: { bots: GroupBot[]; servers: McpServer[] }
     {message && <p role="status">{message}</p>}
   </details>;
 }
+
+type VisitorMember = {id:string; username:string; display_name:string; enabled:number; allow_history:number};
+type VisitorList = {visitors:VisitorMember[]; revision:number; invite_path:string};
+function VisitorMembers({cid,onChanged}:{cid:string;onChanged:()=>void}) {
+  const [data,setData]=useState<VisitorList|null>(null),[panel,setPanel]=useState<VisitorMember|null>(null);
+  const [confirmRemove,setConfirmRemove]=useState(false);
+  const [password,setPassword]=useState(""),[name,setName]=useState(""),[busy,setBusy]=useState(false),[error,setError]=useState(""),[copied,setCopied]=useState(false);
+  const refresh=useCallback(async()=>{const next=await api<VisitorList>(`/conversations/${cid}/visitors`);setData(next);return next;},[cid]);
+  useEffect(()=>{let live=true;api<VisitorList>(`/conversations/${cid}/visitors`).then(d=>{if(live)setData(d);}).catch(()=>{if(live)setError("访客列表暂不可用，请刷新后重试。");});return()=>{live=false;};},[cid]);
+  useEffect(()=>{const clear=()=>{setPassword("");setPanel(null);setConfirmRemove(false);};window.addEventListener("pagehide",clear);return()=>window.removeEventListener("pagehide",clear);},[]);
+  async function change(action:string,member?:VisitorMember) {
+    if(!data||busy)return;setBusy(true);setError("");setPassword("");setCopied(false);
+    try {
+      const result=await api<{visitor:VisitorMember;password?:string}>(`/conversations/${cid}/visitors${member?`/${member.id}`:""}`,member?{action,expected_revision:data.revision,...(action==="history"?{allow_history:!member.allow_history}:{})}:{display_name:name,expected_revision:data.revision},member?"PATCH":"POST");
+      await refresh();onChanged();setName("");setConfirmRemove(false);setPanel(action==="remove"?null:result.visitor);setPassword(result.password||"");
+    }catch{setError("操作未完成：名额或成员状态可能已变化，请刷新列表后重试。");await refresh().catch(()=>{});}finally{setBusy(false);}
+  }
+  const link=data?new URL(data.invite_path,location.origin).href:"";
+  const invite=panel?`Carme 群聊邀请\n链接：${link}\n账号：${panel.username}${password?`\n密码：${password}`:""}\n请先通过 Cloudflare Access，再登录群聊。`:"";
+  return <div className="visitor-members">
+    <h4>Visitor bot · 人类访客（{data?.visitors.filter(v=>v.enabled).length||0}/3）</h4>
+    <p className="detail-note">仅访问此群。创建或调整历史范围会停止旧群任务。访客需另行获得 Cloudflare Access 准入。</p>
+    {data?.visitors.map(v=><button className="member-row" key={v.id} onClick={()=>{setPassword("");setCopied(false);setConfirmRemove(false);setPanel(v);}}><span className="visitor-avatar">客</span><span><strong>{v.display_name}</strong><small>{v.enabled?"人类访客":"已移出"}</small></span><ChevronRight size={15}/></button>)}
+    <form onSubmit={e=>{e.preventDefault();void change("create");}} className="visitor-create"><label>访客名称<input value={name} maxLength={80} onChange={e=>setName(e.target.value)} placeholder="例如：小林"/></label><button className="secondary-button" disabled={busy||!data||!name.trim()||(data.visitors.filter(v=>v.enabled).length>=3)}>新建 visitor bot</button></form>
+    {error&&<p role="alert">{error}</p>}
+    {panel&&<Modal title={panel.display_name} closeDisabled={busy} onClose={()=>{setPanel(null);setPassword("");setConfirmRemove(false);}}>
+      <div className="modal-body visitor-invite">
+        <p className="detail-note">{panel.enabled?"人类访客":"已移出的人类访客"}</p>
+        {!!panel.enabled&&<>
+          <label className="visitor-history-control">历史消息权限<select aria-label="历史消息权限" value={panel.allow_history?"allow":"deny"} disabled={busy} onChange={()=>void change("history",panel)}><option value="allow">允许</option><option value="deny">不允许</option></select></label>
+          <button className="secondary-button" disabled={busy} onClick={()=>void change("reset_password",panel)}>重置密码</button>
+          <hr className="visitor-member-divider"/>
+          <button className="secondary-button visitor-remove-button" disabled={busy} onClick={()=>{setError("");setConfirmRemove(true);}}>移出群聊</button>
+        </>}
+        {!panel.enabled&&<button className="secondary-button" disabled={busy||(data?.visitors.filter(v=>v.enabled).length||0)>=3} onClick={()=>void change("reinvite",panel)}>重新邀请</button>}
+        <details className="visitor-invite-details" open={!!password}>
+          <summary>邀请信息</summary>
+          <p>{password?"密码仅此次显示，请复制后自行转交。关闭后只能重置。":"不保存明文密码。如需新的密码，请点击重置。"}</p>
+          <label>邀请信息<textarea readOnly aria-label="邀请信息" value={invite} rows={7}/></label>
+          <button className="primary-button" disabled={busy||!panel.enabled} onClick={()=>{void navigator.clipboard.writeText(invite).then(()=>setCopied(true)).catch(()=>setError("无法自动复制，请选中邀请信息手动复制。"));}}>{copied?"已复制":"一键复制邀请"}</button>
+        </details>
+        {error&&!confirmRemove&&<p role="alert">{error}</p>}
+      </div>
+    </Modal>}
+    {panel&&confirmRemove&&<Modal title="移出群聊" closeDisabled={busy} onClose={()=>setConfirmRemove(false)}>
+      <div className="modal-body">
+      <p>移出后，该访客当前登录会话将立即失效，原账号和密码不能再次进入此群。</p>
+      {error&&<p role="alert">{error}</p>}
+      <div className="form-actions">
+        <button className="secondary-button" disabled={busy} onClick={()=>setConfirmRemove(false)}>取消</button>
+        <button className="primary-button danger-button" disabled={busy} onClick={()=>void change("remove",panel)}>{busy?"正在移出…":"确认移出"}</button>
+      </div>
+      </div>
+    </Modal>}
+  </div>;
+}
+
+type VisitorSession={id:string;visitor_id:string;conversation_id:string;display_name:string};
+type VisitorGroup={title:string;access_revision:number;members:{id:string;kind:string;name:string}[]};
+type VisitorMessage={id:string;sender_kind:string;sender_id:string;content:string;status:string;task_ids:string[];attachments:{id:string;name:string}[]};
+function VisitorApp({account,cid}:{account:string;cid:string}) {
+  const base=`/api/visitor/${account}`,groupPath=`${base}/conversations/${cid}`;
+  const [session,setSession]=useState<VisitorSession|null>(null),[ready,setReady]=useState(false),[group,setGroup]=useState<VisitorGroup|null>(null);
+  const [messages,setMessages]=useState<VisitorMessage[]>([]),[username,setUsername]=useState(""),[password,setPassword]=useState(""),[error,setError]=useState("");
+  const [content,setContent]=useState(""),[mode,setMode]=useState("message"),[busy,setBusy]=useState(false),[pages,setPages]=useState(1),[more,setMore]=useState(false);
+  const [tasks,setTasks]=useState<Record<string,string>>({});
+  const csrfRef=useRef(""),retry=useRef<{content:string;mode:string;id:string}|null>(null),generation=useRef(0);
+  const clear=useCallback((reason="")=>{generation.current++;csrfRef.current="";retry.current=null;setSession(null);setGroup(null);setMessages([]);setTasks({});setContent("");setPassword("");setPages(1);setError(reason);},[]);
+  const request=useCallback(async(path:string,body?:unknown,method=body===undefined?"GET":"POST",signal?:AbortSignal)=>{
+    const response=await fetch(path,{method,signal,credentials:"same-origin",cache:"no-store",redirect:"error",headers:{...(body===undefined?{}:{"Content-Type":"application/json"}),...(csrfRef.current?{"X-Carme-CSRF":csrfRef.current}:{})},...(body===undefined?{}:{body:JSON.stringify(body)})});
+    if(!response.ok||!response.headers.get("content-type")?.includes("application/json"))throw Error([401,403,404].includes(response.status)?"登录或群访问资格已失效，请重新登录。":"暂时无法完成，请检查网络或稍后重试。");
+    return response.json();
+  },[]);
+  useEffect(()=>{let live=true;const controller=new AbortController();request(`${base}/session`,undefined,"GET",controller.signal).then(d=>{if(live){csrfRef.current=d.csrf;if(d.session.conversation_id===cid)setSession(d.session);}}).catch(()=>{}).finally(()=>{if(live)setReady(true);});return()=>{live=false;controller.abort();};},[base,cid,request]);
+  useEffect(()=>{const hide=()=>clear(),show=(e:PageTransitionEvent)=>{if(e.persisted)location.reload();};window.addEventListener("pagehide",hide);window.addEventListener("pageshow",show);return()=>{window.removeEventListener("pagehide",hide);window.removeEventListener("pageshow",show);};},[clear]);
+  useEffect(()=>{
+    if(!session)return;
+    const controller=new AbortController();let dead=false,loading=false,revision=-1;const epoch=generation.current;
+    async function refresh(){
+      if(loading||dead)return;loading=true;
+      try {
+        const current=await request(`${base}/session`,undefined,"GET",controller.signal);
+        if(current.session.id!==session!.id)throw Error("登录状态已变化，请重新登录。");
+        const info=await request(groupPath,undefined,"GET",controller.signal);
+        if(dead||generation.current!==epoch)return;
+        if(revision!==info.conversation.access_revision){setMessages([]);setTasks({});revision=info.conversation.access_revision;}
+        const rows:VisitorMessage[]=[];let after=0,lastCount=0;
+        for(let i=0;i<pages;i++){const page=await request(`${groupPath}/messages?after=${after}&limit=100`,undefined,"GET",controller.signal);rows.push(...page.messages);after=page.next_after;lastCount=page.messages.length;if(lastCount<100)break;}
+        const check=await request(groupPath,undefined,"GET",controller.signal);
+        if(check.conversation.access_revision!==revision){setMessages([]);setTasks({});return;}
+        if(dead||generation.current!==epoch)return;setGroup(info.conversation);setMessages(rows);setMore(lastCount===100);setError("");
+      }catch(e){if(!dead&&generation.current===epoch)clear(e instanceof Error?e.message:"连接已断开，请重新登录。");}finally{loading=false;}
+    }
+    void refresh();const timer=window.setInterval(()=>void refresh(),1500);
+    const events=new EventSource(`${groupPath}/events`);
+    events.onmessage=e=>{if(dead||generation.current!==epoch)return;try{const data=JSON.parse(e.data);if(data.type==="task")setTasks(old=>({...old,[data.task.id]:data.task.status}));void refresh();}catch{/* Only the authoritative refresh paints messages. */}};
+    events.onerror=()=>{setMessages([]);setTasks({});void refresh();};
+    return()=>{dead=true;controller.abort();window.clearInterval(timer);events.close();};
+  },[session,base,groupPath,pages,request,clear]);
+  async function login(e:FormEvent){e.preventDefault();const epoch=generation.current;setBusy(true);setError("");try{await request(`${base}/session`).then(d=>{csrfRef.current=d.csrf;}).catch(()=>{csrfRef.current="";});const d=await request(`${base}/login`,{username,password,conversation_id:cid});if(epoch!==generation.current)return;csrfRef.current=d.csrf;generation.current++;setSession(d.session);}catch(e){setError(e instanceof Error?e.message:"登录未完成");}finally{setPassword("");setBusy(false);}}
+  async function send(e:FormEvent){e.preventDefault();if(!content.trim()||busy)return;setBusy(true);setError("");const epoch=generation.current;if(!retry.current||retry.current.content!==content||retry.current.mode!==mode)retry.current={content,mode,id:crypto.randomUUID()};try{await request(`${groupPath}/messages`,{content,mode,request_id:retry.current.id});if(epoch===generation.current){setContent("");retry.current=null;}}catch(e){if(epoch===generation.current)setError(e instanceof Error?e.message:"发送未完成，请重试");}finally{setBusy(false);}}
+  if(!ready)return <main className="visitor-page"><p>正在检查登录状态…</p></main>;
+  if(!session)return <main className="visitor-page visitor-login"><h1>Carme 群聊邀请</h1><p>请使用群主提供的访客账号和密码。访问前需通过 Cloudflare Access。</p><form onSubmit={login}><label>访客账号<input autoComplete="username" value={username} onChange={e=>setUsername(e.target.value)} required/></label><label>密码<input type="password" autoComplete="current-password" value={password} onChange={e=>setPassword(e.target.value)} required/></label><button className="primary-button" disabled={busy}>{busy?"正在登录…":"进入群聊"}</button></form>{error&&<p role="alert">{error}</p>}<button className="text-button" onClick={()=>location.reload()}>重新检查入口登录</button></main>;
+  const memberName=(id:string)=>group?.members.find(m=>m.id===id)?.name||(id===session.visitor_id?session.display_name:"已离开成员");
+  return <main className="visitor-page visitor-chat"><header><div><h1>{group?.title||"受邀群聊"}</h1><p>{session.display_name} · 人类访客</p></div><button className="secondary-button" onClick={()=>{void request(`${base}/session`,undefined,"DELETE").catch(()=>{});clear();}}>退出登录</button></header><nav aria-label="群成员">{group?.members.map(m=><span key={m.id}>{m.name}{m.kind==="visitor"?" · 访客":""}</span>)}</nav><p className="detail-note">仅显示你获准查看的群消息。任务结果留在本群；向外发送或提交数据需群主批准。</p><section aria-label="群消息" className="visitor-messages">{messages.length===0&&<p>暂无可见消息</p>}{messages.map(m=><article key={m.id}><strong>{memberName(m.sender_id)}</strong><div className="visitor-message-body">{m.content}</div>{m.status==="streaming"&&<small>正在回复…</small>}{m.task_ids.map(id=><small key={id}>{tasks[id]?statusText[tasks[id]]||"任务处理中":"已请求 AI"}</small>)}{m.attachments.map(f=><a key={f.id} href={`${groupPath}/attachments/${f.id}/download`} download>{f.name} · 下载</a>)}</article>)}</section>{more&&<button className="secondary-button" onClick={()=>setPages(p=>p+1)}>继续加载消息</button>}<form className="visitor-compose" onSubmit={send}><label>发送方式<select value={mode} onChange={e=>setMode(e.target.value)}><option value="message">只发消息</option><option value="task">请群内 AI 执行</option></select></label><label>消息<textarea maxLength={20000} value={content} onChange={e=>setContent(e.target.value)} placeholder="输入消息；请求 AI 时可 @成员名称" required/></label><button className="primary-button" disabled={busy||!content.trim()}>{busy?"正在发送…":"发送"}</button></form>{error&&<p role="alert">{error}</p>}</main>;
+}
+
+export default function App(){return VISITOR_ENTRY?<VisitorApp account={VISITOR_ENTRY[1]} cid={VISITOR_ENTRY[2]}/>:<OwnerApp/>;}

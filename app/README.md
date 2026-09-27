@@ -1,8 +1,16 @@
 # Carme
 
-自托管的 Bot 团队。模仿 Grok Bot 的持续聊天与三栏界面，通过同一网页应用 / PWA 在 iOS 和 macOS 上使用。
+自托管的 Bot 团队。参考 Grok Bot 的持续聊天与三栏界面，通过同一网页应用 / PWA 在 iOS 和 macOS 上使用。
 
-**Bot 使用的执行电脑目前暂定为 MacBook，后续可以替换。** 它与保存任务的常驻后端 Mac、用户使用的客户端是三个不同角色。
+## 2026-09-23：Docker Pi 持久会话
+
+Docker 部署的 Pi 聊天使用固定版本 Pi 0.85.1 SDK 的 SessionManager / AgentSession：按账号、聊天和 Bot 保存原生消息、工具调用与结果，长对话由 Pi 原生压缩。Control / Pi 重启后继续同一会话；首次继续旧聊天时导入原文。账号隔离、长期记忆、动作审批及操作回执继续由 Carme 管理，子任务仍使用独立的任务上下文。下文旧版“宿主 CLI”说明不适用于当前 Docker 部署。
+
+会话文件位于账号 `runtime/control/pi-sessions/`，每个 Pi Worker 只挂载自己的会话目录，桌面及 Action 不挂载。清空最近删除会同步清理会话文件。普通记忆更新不再清空上下文；记忆撤销、过期或权限收回时，重新建立不含相关派生回复的上下文。历史附件按 ID 读取，不再反复作为新指令全文注入。
+
+`isolation.yaml` 的 Pi runtime profile 可设置 `context_window` / `max_output_tokens`。缺省有效预算为 32768 / 8192 tokens，这是保守的运行预算，不是对供应商模型实际最大窗口的声明；调整前需确认代理和供应商限制。前端“长对话摘要”展示当前引擎生成的摘要。原文持续保存，但压缩可能遗漏细节，不承诺无限精确记忆。现阶段旧聊天只迁移已归档的消息和附件索引，无法还原以前未持久化的原生 Pi 工具轨迹。
+
+**Bot 使用的执行电脑目前暂定为 2018 MacBook，后续可以替换。** 它与保存任务的常驻后端 Mac、用户使用的客户端是三个不同角色。
 
 ## 当前实现（0.2.0，2026-09-12）
 
@@ -231,7 +239,7 @@ Carme 的「本机屏幕画面 / 远程鼠标键盘」走 macOS 截屏与 CGEven
 
 ## 固定运行目录
 
-当前 8899 服务已从临时预览目录迁入 `WBAI/.local/active/`，包括 `config/`、`data/` 和只读写给当前用户的 `.env`。迁移前副本保存在 `.local/backups/`，原项目 `config/`、`data/`、`.env` 未覆盖，整个 `.local/` 已排除版本控制。后续启动同一实例请在 `WBAI/` 下运行：
+当前 8899 服务已从临时预览目录迁入 `app/.local/active/`，包括 `config/`、`data/` 和只读写给当前用户的 `.env`。迁移前副本保存在 `.local/backups/`，原项目 `config/`、`data/`、`.env` 未覆盖，整个 `.local/` 已排除版本控制。后续启动同一实例请在 `app/` 下运行：
 
 ```bash
 ./.venv/bin/python -m carme.cli --profile .local/active serve --host 127.0.0.1 --port 8899
@@ -293,7 +301,7 @@ Carme 的「本机屏幕画面 / 远程鼠标键盘」走 macOS 截屏与 CGEven
 
 如果已有配置含多个 ingress、路径路由或其他 `originRequest` 字段，网页会拒绝覆盖并保持原文件字节不变；请先人工备份并明确整理成 Carme 独占的单根路由。读取器和启动检查也不会把 `/foo`、重复 origin 或缺少 hostname 的路由当成有效入口。
 
-在 `WBAI/` 目录执行：
+在 `app/` 目录执行：
 
 ```bash
 ./deploy/cloudflared/carme-tunnel.sh check

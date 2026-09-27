@@ -35,7 +35,13 @@ class ShellTool(Tool):
     }
 
     async def run(self, ctx: ToolContext, command: str, cwd: str | None = None, timeout: int | None = None) -> str:
-        if ctx.extras.get("policy"):
+        policy = ctx.extras.get('policy', {})
+        common_compute = (policy.get('context_mode') == 'visitor_group' and policy.get('target') == 'container'
+                          and ctx.store.task_context(ctx.task_id)['context_mode'] == 'visitor_group'
+                          and policy.get('context_epoch') == ctx.store.context_epoch(ctx.task_id))
+        if common_compute and (await ctx.sandbox()).spec.mode != 'docker':
+            raise ValueError('visitor_container_required')
+        if policy and not ctx.local_autonomy and not common_compute:
             decision = await ctx.request_approval(kind="shell", summary="执行 Shell 命令",
                                                  detail={"command": command, "cwd": cwd, "timeout": timeout})
             if not decision.approved:

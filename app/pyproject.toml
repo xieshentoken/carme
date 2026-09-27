@@ -4,6 +4,7 @@ version = "0.2.0"
 description = "自托管的常驻 AI 员工团队 —— Grok Bot 的自建替代品"
 requires-python = ">=3.11"
 dependencies = [
+    "PyJWT==2.14.0",
     "fastapi>=0.115",
     "uvicorn[standard]>=0.32",
     "httpx>=0.27",

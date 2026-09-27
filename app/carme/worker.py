@@ -102,16 +102,50 @@ async def action(payload, limit):
             "stdout": raw.decode(errors="replace"), "stderr": err.decode(errors="replace")}
 
 
-async def pi(payload, rpc):
+async def pi(payload, rpc, *, timeout=600):
     """Real pinned Pi with a local HTTP facade; long-lived credentials stay in Control."""
     proxy_token = secrets.token_urlsafe(32)
     clients = set()
-    model_error = []
-
     async def client(reader, writer):
         clients.add(asyncio.current_task())
+        sent_headers = False
+        ended = False
+        async def frame(data):
+            nonlocal sent_headers, ended
+            kind = data.get('type')
+            if kind == 'accepted': return
+            if ended: raise RuntimeError('model_frame_after_end')
+            if kind == 'headers':
+                if sent_headers or data['content_type'] not in {'text/event-stream','application/json'}:
+                    raise RuntimeError('model_headers_invalid')
+                status = int(data['status'])
+                if not 200 <= status <= 599: raise RuntimeError('model_status_invalid')
+                writer.write((f"HTTP/1.1 {status} Model response\r\nContent-Type: " + data['content_type'] +
+                    "\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n").encode())
+                sent_headers = True
+            elif kind == 'chunk':
+                if not sent_headers: raise RuntimeError('model_headers_required')
+                raw = base64.b64decode(data['body'], validate=True)
+                if not 0 < len(raw) <= 32768: raise RuntimeError('model_chunk_invalid')
+                writer.write(f"{len(raw):x}\r\n".encode() + raw + b"\r\n")
+            elif kind == 'end':
+                if not sent_headers: raise RuntimeError('model_headers_required')
+                writer.write(b"0\r\n\r\n"); ended = True
+            elif kind == 'error':
+                # A truncated stream must remain truncated: never turn it into a successful answer.
+                if not sent_headers:
+                    status = 503 if data.get('retryable') else 400
+                    raw = json.dumps({'error':{'message':'Service unavailable' if status == 503 else 'Request denied'}}).encode()
+                    writer.write(f"HTTP/1.1 {status} Model error\r\nContent-Type: application/json\r\nContent-Length: {len(raw)}\r\nConnection: close\r\n\r\n".encode()+raw)
+                    sent_headers = True
+                ended = True
+                writer.close()
+            else:
+                raise RuntimeError('model_frame_denied')
+            if not writer.is_closing():
+                async with asyncio.timeout(30): await writer.drain()
         try:
-            async with asyncio.timeout(600):
+            async with asyncio.timeout(timeout):
                 header = await reader.readuntil(b"\r\n\r\n")
                 lines = header.decode("latin1").split("\r\n")
                 headers = dict(line.split(":", 1) for line in lines[1:] if ":" in line)
@@ -121,17 +155,13 @@ async def pi(payload, rpc):
                         or headers.get("authorization") != "Bearer " + proxy_token or "transfer-encoding" in headers):
                     raise ValueError("model_proxy_request_denied")
                 body = json.loads(await reader.readexactly(size))
-                response = await rpc("model", {"body": body})
-                raw = base64.b64decode(response["body"], validate=True)
-                writer.write(("HTTP/1.1 200 OK\r\nContent-Type: " + response["content_type"] +
-                    f"\r\nContent-Length: {len(raw)}\r\nConnection: close\r\n\r\n").encode() + raw)
-                await writer.drain()
-        except Exception as exc:
-            if str(exc).startswith("model_provider_http_"):
-                model_error.append(str(exc))
-            writer.write(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-            with contextlib.suppress(Exception):
-                await writer.drain()
+                await rpc("model", {"body": body}, on_frame=frame)
+                if not ended: raise RuntimeError('model_stream_incomplete')
+        except Exception:
+            if not sent_headers:
+                writer.write(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                with contextlib.suppress(Exception): await writer.drain()
+
         finally:
             clients.discard(asyncio.current_task())
             writer.close()
@@ -140,29 +170,42 @@ async def pi(payload, rpc):
 
     server = await asyncio.start_server(client, "127.0.0.1", 0, limit=65536)
     model_id = payload["model"].split("/", 1)[1]
+    limits = payload.get('model_limits', {'context_window': 32768, 'max_output_tokens': 8192})
     models = {"providers": {"carme": {"baseUrl": f"http://127.0.0.1:{server.sockets[0].getsockname()[1]}/v1",
         "api": "openai-completions", "apiKey": proxy_token,
         "models": [{"id": model_id, "name": model_id, "reasoning": False, "input": ["text"],
                     "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
-                    "contextWindow": 128000, "maxTokens": 8192}]}}}
+                    "contextWindow": limits['context_window'], "maxTokens": limits['max_output_tokens']}]}}}
+    async def execute(name, arguments, tool_call_id=''):
+        return await rpc('tool', {'name': name, 'arguments': arguments,
+                                 **({'tool_call_id': tool_call_id} if tool_call_id else {})})
+    previous = ''
+    async def stream(event):
+        nonlocal previous
+        content = event['content']
+        replace = not content.startswith(previous)
+        delta = content if replace else content[len(previous):]
+        previous = content
+        return await rpc('stream', {**event, 'content': delta, 'replace': replace})
     try:
         result = await _run_cli_process("pi", payload["prompt"],
             binary="/opt/pi/node_modules/.bin/pi", model="carme/" + model_id,
-            effort=payload["effort"], timeout=600, tool_specs=payload["tools"],
-            tool_execute=lambda name, arguments: rpc("tool", {"name": name, "arguments": arguments}),
-            max_tool_calls=payload["max_tool_calls"], on_stream=lambda event: rpc("stream", event),
-            runtime_models=models)
-        return {"text": result.text}
-    except Exception:
-        if model_error:
-            return {"error": model_error[-1]}
-        raise
+            effort=payload["effort"], timeout=timeout, tool_specs=payload["tools"],
+            tool_execute=execute,
+            max_tool_calls=payload["max_tool_calls"], on_stream=stream,
+            on_diagnostic=lambda event: rpc('diagnostic', event),
+            runtime_models=models,
+            native_context={'task_id': payload['session']['task_id'], 'messages': payload['messages'],
+                            'system_prompt': payload['system_prompt'], 'session_dir': '/session',
+                            'model_limits': limits} if payload.get('session') else None)
+        return {"text": result.text, 'context_summary': result.context_summary}
     finally:
         server.close()
-        await server.wait_closed()
-        for task in clients:
+        pending = list(clients)
+        for task in pending:
             task.cancel()
-        await asyncio.gather(*clients, return_exceptions=True)
+        await asyncio.gather(*pending, return_exceptions=True)
+        await server.wait_closed()
 
 
 async def main():
@@ -172,13 +215,14 @@ async def main():
     job = json.loads(await reader.readline())
     pending = {}
     rpc_lock = asyncio.Semaphore(24 if job['role'] == 'browser' else 1)
+    model_lock = asyncio.Semaphore(1)
     last_lease = time.monotonic()
 
-    async def rpc(kind, payload):
-        async with rpc_lock:
+    async def rpc(kind, payload, on_frame=None):
+        async with (model_lock if kind == 'model' else rpc_lock):
             call_id = secrets.token_hex(16)
             future = loop.create_future()
-            pending[call_id] = future
+            pending[call_id] = (future, on_frame)
             try:
                 output({"type": "rpc", "id": call_id, "kind": kind, "payload": payload})
                 return await future
@@ -192,10 +236,15 @@ async def main():
             if response == {"type": "lease"}:
                 last_lease = time.monotonic()
             elif response.get("id") in pending:
-                if "error" in response:
-                    pending[response["id"]].set_exception(RuntimeError(response["error"]))
+                future, on_frame = pending[response['id']]
+                if future.done(): raise RuntimeError('duplicate_relay_result')
+                if 'frame' in response and on_frame:
+                    await on_frame(response['frame'])
+                    if response['frame'].get('type') in {'end','error'}: future.set_result(None)
+                elif "error" in response:
+                    future.set_exception(RuntimeError(response["error"]))
                 else:
-                    pending[response["id"]].set_result(response["result"])
+                    future.set_result(response["result"])
             else:
                 raise RuntimeError("relay_protocol_denied")
         raise RuntimeError("broker_disconnected")
@@ -210,7 +259,7 @@ async def main():
         from .docker_browser import serve
         work = serve(job['payload'], rpc)
     elif job['role'] == 'pi':
-        work = pi(job['payload'], rpc)
+        work = pi(job['payload'], rpc, timeout=max(.1, job.get('deadline', time.time()+600)-time.time()))
     elif job['role'] == 'action':
         work = action(job['payload'], job['max_output_bytes'])
     else:

@@ -4,7 +4,7 @@ Requires prebuilt image IDs and an isolated Docker CLI config. Never uses person
 credentials, the live Carme database, global cleanup, or a model provider account.
 """
 from __future__ import annotations
-import asyncio, hashlib, io, json, os, secrets, shutil, signal, socket, subprocess, sys, tempfile, time, zipfile
+import asyncio, hashlib, io, json, os, secrets, shutil, signal, socket, sqlite3, subprocess, sys, tempfile, time, zipfile
 from pathlib import Path
 import httpx, yaml
 
@@ -35,7 +35,7 @@ def docker(*args, check=True, text=True):
 
 
 def record(name, details=None):
-    RESULTS.append({'id':name, 'status':'pass', 'layer':'real Docker / synthetic model', 'details':details})
+    RESULTS.append({'id':name, 'status':'pass', 'layer':('real Docker / real configured provider' if PARAMS.get('group_provider_config') else 'real Docker / synthetic model'), 'details':details})
     (EVIDENCE/'docker-results.json').write_text(json.dumps({'instance':INSTANCE,'run':str(RUN),'tests':RESULTS},indent=2))
     print('PASS', name, flush=True)
 
@@ -56,8 +56,13 @@ def inspect_workers():
         assert host['Memory']==768*1024*1024 and host['MemorySwap']==host['Memory']
         assert not host.get('Devices') and host.get('PidMode','') != 'host'
         mounts=value['Mounts'];role=config['Labels']['carme.role']
-        assert len(mounts)==(0 if role=='pi' else 3)
+        assert len(mounts) in ({0,1} if role=='pi' else {3})
         for mount in mounts:
+            if role == 'pi':
+                assert Path(mount['Source']).is_relative_to(RUN/'实例 Carme'/'runtime'/'control'/'pi-sessions')
+                assert mount['Destination'] == '/session' and mount['RW']
+                assert len(Path(mount['Source']).relative_to(RUN/'实例 Carme'/'runtime'/'control'/'pi-sessions').parts) == 3
+                continue
             assert Path(mount['Source']).is_relative_to(RUN/'实例 Carme'/'runtime'/'runs')
             assert mount['Destination'] in ('/workspace','/out','/inputs')
             assert mount['RW'] == (mount['Destination']!='/inputs')
@@ -65,10 +70,11 @@ def inspect_workers():
 
 
 MODEL_SERVER = r'''
-import json, ssl, time
+import json, re, ssl, time
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 CASES=json.loads(Path('/fixture/cases.json').read_text())
+ATTEMPTS={}
 class Handler(BaseHTTPRequestHandler):
  def log_message(self,*args): pass
  def do_POST(self):
@@ -80,6 +86,16 @@ class Handler(BaseHTTPRequestHandler):
    self.send_response(401 if case=='authfailure' else 302);self.send_header('Location','https://169.254.169.254/blocked');self.send_header('Content-Length','0');self.end_headers();return
   tools=body.get('tools',[]);pi=any(t['function']['name'].startswith('carme_') for t in tools)
   count=sum(m.get('role')=='tool' for m in body['messages'])
+  trial=re.search(r'M2_TRIAL:([a-f0-9]+)',content);key=case+':'+(trial.group(1) if trial else 'probe')
+  attempt=ATTEMPTS.get(key,0)+1;ATTEMPTS[key]=attempt
+  if (case=='flaky' and count>0 and not ATTEMPTS.get(key+':failed')) or (case=='limited' and attempt==1) or case in ('quota','overload'):
+   ATTEMPTS[key+':failed']=True
+   status=429 if case in ('quota','limited') else 503
+   data=json.dumps({'error':{'message':'insufficient_quota' if case=='quota' else 'SECRET_PROVIDER_BODY_UNAVAILABLE'}}).encode()
+   self.send_response(status);self.send_header('Content-Type','application/json');self.send_header('Content-Length',str(len(data)));self.end_headers();self.wfile.write(data);return
+  if case=='dropstream' and attempt==1:
+   data=b'data: {"id":"fixture","choices":[{"index":0,"delta":{"content":"PARTIAL_NOT_FINAL"},"finish_reason":null}]}\n\n'
+   self.send_response(200);self.send_header('Content-Type','text/event-stream');self.send_header('Content-Length','99999');self.end_headers();self.wfile.write(data);self.wfile.flush();self.close_connection=True;return
   actions=CASES.get(case,[])
   if count < len(actions):
    name,args=actions[count]
@@ -92,7 +108,11 @@ class Handler(BaseHTTPRequestHandler):
    {'id':'fixture','object':'chat.completion.chunk','created':1,'model':body['model'],'choices':[{'index':0,'delta':delta,'finish_reason':None}]},
    {'id':'fixture','object':'chat.completion.chunk','created':1,'model':body['model'],'choices':[{'index':0,'delta':{},'finish_reason':finish}], 'usage':{'prompt_tokens':10,'completion_tokens':5,'total_tokens':15}}]
   data=(''.join('data: '+json.dumps(c)+'\n\n' for c in chunks)+'data: [DONE]\n\n').encode()
-  self.send_response(200);self.send_header('Content-Type','text/event-stream');self.send_header('Content-Length',str(len(data)));self.end_headers();self.wfile.write(data)
+  self.send_response(200);self.send_header('Content-Type','text/event-stream');self.send_header('Content-Length',str(len(data)));self.end_headers()
+  if case=='slowstream':
+   first=(''.join('data: '+json.dumps(c)+'\n\n' for c in chunks[:2])).encode()
+   self.wfile.write(first);self.wfile.flush();time.sleep(4);self.wfile.write(data[len(first):])
+  else:self.wfile.write(data)
 server=ThreadingHTTPServer(('0.0.0.0',443),Handler)
 ctx=ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER);ctx.load_cert_chain('/fixture/cert.pem','/fixture/key.pem')
 server.socket=ctx.wrap_socket(server.socket,server_side=True);server.serve_forever()
@@ -102,7 +122,7 @@ server.socket=ctx.wrap_socket(server.socket,server_side=True);server.serve_forev
 def setup():
     global PERSONAL_PROCESS, CONTROL_LAUNCH, CONTROL_NETWORK
     home=RUN/'实例 Carme'
-    for sub in ('config','runtime/control','runtime/artifacts','runtime/skills','runtime/secrets','runtime/broker'):
+    for sub in ('config','runtime/control','runtime/artifacts','runtime/skills','runtime/secrets','runtime/credentials','runtime/broker'):
         path=home/sub;path.mkdir(parents=True,exist_ok=True);path.chmod(0o777)
     fixture=RUN/'fixture';fixture.mkdir();capture=RUN/'capture';capture.mkdir();capture.chmod(0o777)
     (fixture/'model.py').write_text(MODEL_SERVER)
@@ -139,6 +159,9 @@ Path('/out/isolation.json').write_text(json.dumps(r))
       'pids':[['shell',{'command':"python - <<'PYCODE'\nimport subprocess\na=[]\ntry:\n for i in range(90):a.append(subprocess.Popen(['sleep','5']))\nexcept OSError:print('PIDS_LIMIT_EFFECTIVE',len(a))\nfinally:\n for p in a:p.terminate()\n for p in a:p.wait()\nPYCODE",'timeout':15}]],
       'readonly':[['write_file',{'path':'unauthorized','content':'DENIED'}],['bash',{'command':'touch /workspace/native-escape'}]],
     }
+    if PARAMS.get('reliability'):
+        cases.update(flaky=[['write_file',{'path':'one-effect.txt','content':'EXACTLY_ONCE'}]],
+            dropstream=[],slowstream=[],quota=[],overload=[],limited=[])
     if PARAMS.get('m3_project'):
         import base64
         from carme import projects
@@ -165,6 +188,8 @@ Path('/out/isolation.json').write_text(json.dumps(r))
     admin=secrets.token_urlsafe(32);broker_key=secrets.token_hex(32);provider_key=secrets.token_hex(32)
     for filename,value in [('control-token',admin),('broker-key',broker_key),('provider-key',provider_key)]:
         (home/'runtime/secrets'/filename).write_text(value);(home/'runtime/secrets'/filename).chmod(0o644)
+    (home/'runtime/credentials/pi-carme-api').write_text(provider_key)
+    (home/'runtime/credentials/pi-carme-api').chmod(0o644)
     shutil.copy2(fixture/'cert.pem',home/'config/model-ca.pem')
     agents={'defaults':{'max_steps':12},'agents':{}}
     for name,engine,tools in [('pi','pi',['files','exec']),('api','api',['files','exec']),('readonly','pi',['read_file']),('peer','pi',['files','exec'])]:
@@ -186,6 +211,19 @@ Path('/out/isolation.json').write_text(json.dumps(r))
         config['browser.yaml'] = {'enabled': True}
         for key in ('api', 'pi'):
             agents['agents'][key]['tools'] += ['browser', 'computer']
+    if PARAMS.get('group_chat'):
+        for key, name in [('pi','示例甲'),('peer','示例乙'),('api','示例丙')]:
+            agents['agents'][key].update(name=name, creation_source='user_created', tools=[])
+        agents['agents']['readonly']['name']='旧预置'
+    if PARAMS.get('group_provider_config'):
+        real=json.loads(Path(PARAMS['group_provider_config']).read_text())
+        profile['model']=real['model']
+        isolation['credentials']['dedicated']={**real['credential'],'key_file':'/run/secrets/provider-key'}
+        (home/'runtime/secrets/provider-key').write_text(real['key'])
+        (home/'runtime/credentials/pi-carme-api').write_text(real['key'])
+        for agent in agents['agents'].values():
+            agent.update(engine='pi',engine_model=real['model'],model=real['model'],tools=[])
+        config['models.yaml']={'providers':{},'tiers':{},'allow_mock':False}
     for filename,value in config.items():(home/'config'/filename).write_text(yaml.safe_dump(value))
     control=INSTANCE+'-control';NAMES.append(control)
     with socket.socket() as reserve:
@@ -193,8 +231,8 @@ Path('/out/isolation.json').write_text(json.dumps(r))
     args=['run','-d','--name',control,'--label','carme.fixture='+INSTANCE,'--network','bridge','--publish',f'127.0.0.1:{fixed_port}:8899','--read-only','--user','1000:1000',
           '--cap-drop=ALL','--security-opt=no-new-privileges:true','--pids-limit','128','--memory','768m','--cpus','1',
           '--tmpfs','/runtime:rw,nosuid,nodev,size=128m,uid=1000,gid=1000,mode=700','--tmpfs','/tmp:rw,nosuid,nodev,noexec,size=64m,mode=1777',
-          '--env','SSL_CERT_FILE=/config/model-ca.pem']
-    for src,dst,ro in [('config','/config',False),('runtime/control','/control-state',False),('runtime/artifacts','/artifacts',False),('runtime/skills','/skills',True)]:
+          '--env',('SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt' if PARAMS.get('group_provider_config') else 'SSL_CERT_FILE=/config/model-ca.pem')]
+    for src,dst,ro in [('config','/config',False),('runtime/control','/control-state',False),('runtime/artifacts','/artifacts',False),('runtime/skills','/skills',True),('runtime/credentials','/run/credentials',False)]:
         args+=['--mount',f'type=bind,src={home/src},dst={dst}'+(',readonly' if ro else '')]
     for secret in ('control-token','broker-key','provider-key'):
         args+=['--mount',f'type=bind,src={home/"runtime/secrets"/secret},dst=/run/secrets/{secret},readonly']
@@ -251,15 +289,16 @@ async def main():
         await asyncio.sleep(.25)
     assert health['execution']['broker']=='ready'
     record('control_broker_authenticated_ready')
-    probe=await client.post('/api/engines/pi/test',json={'model':'fixture/model','runtime_profile':'dedicated'})
-    assert probe.json()['ok'],probe.json()
-    record('dedicated_profile_connection_probe_no_tools')
+    if not PARAMS.get('group_provider_config'):
+        probe=await client.post('/api/engines/pi/test',json={'model':'fixture/model','runtime_profile':'dedicated'})
+        assert probe.json().get('ok'), (probe.status_code, probe.json())
+        record('dedicated_profile_connection_probe_no_tools')
     async def conversation(agent):
         response=await client.post('/api/conversations',json={'agent_ids':[agent]});response.raise_for_status()
         return response.json()['conversation']['id']
     async def launch(agent,case):
         cid=await conversation(agent)
-        response=await client.post(f'/api/conversations/{cid}/messages',json={'content':'M2_CASE:'+case,'request_id':secrets.token_hex(8),'agent_id':agent})
+        response=await client.post(f'/api/conversations/{cid}/messages',json={'content':'M2_CASE:'+case+' M2_TRIAL:'+secrets.token_hex(8),'request_id':secrets.token_hex(8),'agent_id':agent})
         response.raise_for_status();return cid,response.json()['task_id']
     async def settle(tid,approve=True,timeout=120):
         end=time.time()+timeout
@@ -295,6 +334,109 @@ async def main():
             if not docker('ps','-q','--filter','label=carme.instance='+INSTANCE,'--filter','label=carme.run='+tid):return
             await asyncio.sleep(.2)
         raise RuntimeError('Owned worker still running after interruption')
+    if PARAMS.get('group_chat'):
+        from test_group_docker import run
+        await run(client, settle, record, home, capture, PARAMS, EVIDENCE)
+        await client.aclose()
+        return
+    if PARAMS.get('reliability'):
+        for case, success in [('slowstream',True),('flaky',True),('dropstream',True),('quota',False),('overload',False)]:
+            start=time.monotonic();cid,tid=await launch('pi',case)
+            seen_partial=False
+            if case=='slowstream':
+                for _ in range(120):
+                    detail=(await client.get('/api/conversations/'+cid)).json()
+                    running=(await client.get('/api/tasks/'+tid)).json()['task']['status']
+                    if any('M2_FIXTURE_DONE slowstream' in m['content'] for m in detail['messages'] if m['role']=='assistant') and running=='running':
+                        seen_partial=True; break
+                    if running in ('done','failed'): break
+                    await asyncio.sleep(.1)
+            result=await settle(tid);await drained(tid)
+            assert result['status']==('done' if success else 'failed'), (case,result.get('error'))
+            detail=(await client.get('/api/tasks/'+tid)).json()
+            if case=='slowstream': assert seen_partial, 'response_was_buffered_until_complete'
+            if case=='flaky': assert len([m for m in detail['messages'] if m.get('tool_name')=='write_file'])==1
+            if case=='dropstream': assert 'PARTIAL_NOT_FINAL' not in result['result']
+            requests=[json.loads(line) for line in (capture/'requests.jsonl').read_text().splitlines()]
+            calls=sum('M2_CASE:'+case in json.dumps(req['messages']) for req in requests)
+            expected={'flaky':3,'dropstream':2,'quota':1,'overload':4,'slowstream':1}[case]
+            assert calls==expected, (case,calls)
+            for path in ['/api/tasks/'+tid,'/api/conversations/'+cid,'/api/tasks']:
+                public=(await client.get(path)).text
+                assert 'SECRET_PROVIDER_BODY' not in public and 'model_provider_http_' not in public
+            if not success:
+                async with client.stream('GET','/api/events',params={'task_id':tid,'after_id':0}) as response:
+                    async for line in response.aiter_lines():
+                        assert 'SECRET_PROVIDER_BODY' not in line and 'model_provider_http_' not in line
+                        if line.startswith('data: '):
+                            event=json.loads(line[6:])
+                            if event.get('task_id')==tid and event['type'] in ('task.finished','task.failed'):break
+            diagnostics=[json.loads(line) for line in (home/'runtime/control/diagnostics/execution.jsonl').read_text().splitlines()]
+            if case in ('flaky','dropstream','overload'):
+                assert any(r.get('task_id')==tid and r['stage']=='pi.auto_retry_start' for r in diagnostics)
+            record('reliability_'+case, {'provider_calls':calls,'seconds':round(time.monotonic()-start,2),
+                'live_partial_before_completion':seen_partial if case=='slowstream' else None})
+        record('private_diagnostics_not_in_task_or_chat_responses')
+        soak=[]
+        for index in range(int(PARAMS.get('mixed_tasks', 0))):
+            case=['plain','seed','flaky','dropstream','limited'][index % 5]
+            started=time.monotonic();cid,tid=await launch('pi',case)
+            result=await settle(tid);await drained(tid)
+            assert result['status']=='done',(index,case,result.get('error'))
+            detail=(await client.get('/api/tasks/'+tid)).json()
+            if case in ('seed','flaky'):
+                assert sum(m.get('tool_name')=='write_file' for m in detail['messages'])==1
+            soak.append({'task':index+1,'case':case,'status':'pass','seconds':round(time.monotonic()-started,2)})
+            if (index+1)%10==0:print('Mixed tasks passed',index+1,flush=True)
+        if soak:
+            (EVIDENCE/'mixed-tasks.json').write_text(json.dumps(soak,indent=2))
+            record('mixed_tasks_complete',{'tasks':len(soak),'cases':['plain','file_write','503_after_tool','stream_drop','429_transient']})
+        (EVIDENCE/'docker-inspect.json').write_text(json.dumps(INSPECTED, indent=2))
+        await client.aclose();return
+    if PARAMS.get('native_sessions'):
+        cid, tid = await launch('pi', 'seed')
+        first = await settle(tid); assert first['status'] == 'done', first.get('error')
+        await drained(tid)
+        session_root = home/'runtime/control/pi-sessions'/cid/'pi'
+        files = list(session_root.glob('*/session.jsonl')); assert len(files) == 1
+        entries = [json.loads(line) for line in files[0].read_text().splitlines()]
+        assert any(e.get('message', {}).get('role') == 'toolResult' for e in entries)
+        record('native_session_persisted_outside_action_and_desktop_mounts')
+        async def followup(content):
+            response = await client.post(f'/api/conversations/{cid}/messages', json={
+                'content':content, 'request_id':secrets.token_hex(8), 'agent_id':'pi'})
+            response.raise_for_status(); task_id = response.json()['task_id']
+            task = await settle(task_id); assert task['status'] == 'done', task.get('error')
+            await drained(task_id)
+            return task_id
+        second = await followup('FOLLOWUP_NATIVE_CHAT')
+        requests = [json.loads(line) for line in (capture/'requests.jsonl').read_text().splitlines()]
+        last = requests[-1]['messages']
+        assert any(m['role'] == 'user' and 'M2_CASE:seed' in str(m['content']) for m in last)
+        assert any(m['role'] == 'assistant' and 'tool_calls' in m for m in last)
+        assert any(m['role'] == 'tool' for m in last)
+        detail = (await client.get('/api/tasks/'+second)).json()
+        assert not [m for m in detail['messages'] if m['role'] == 'tool']
+        record('same_chat_native_roles_and_receipts_without_reexecuting_prior_tool')
+        docker('stop',control); docker('rm',control)
+        docker(*CONTROL_LAUNCH); docker('network','connect',CONTROL_NETWORK,control); await wait_ready()
+        for _ in range(100):
+            if (await client.get('/api/health')).json()['execution']['broker'] == 'ready': break
+            await asyncio.sleep(.2)
+        await followup('FOLLOWUP_AFTER_CONTROL_RESTART')
+        requests = [json.loads(line) for line in (capture/'requests.jsonl').read_text().splitlines()]
+        assert 'FOLLOWUP_NATIVE_CHAT' in json.dumps(requests[-1]['messages'])
+        assert 'M2_CASE:seed' in json.dumps(requests[-1]['messages'])
+        record('control_and_pi_restart_preserve_same_conversation')
+        _, other = await launch('pi', 'foreign')
+        result = await settle(other); assert result['status'] == 'done', result.get('error')
+        await drained(other)
+        requests = [json.loads(line) for line in (capture/'requests.jsonl').read_text().splitlines()]
+        assert 'FOLLOWUP_NATIVE_CHAT' not in json.dumps(requests[-1])
+        assert 'M2_CASE:seed' not in json.dumps(requests[-1])
+        record('different_conversation_keeps_separate_context_and_workspace')
+        (EVIDENCE/'docker-inspect.json').write_text(json.dumps(INSPECTED, indent=2))
+        await client.aclose(); return
     if PARAMS.get('docker_browser'):
         for agent in ('api', 'pi'):
             cid, tid = await launch(agent, 'browser');task = await settle(tid)
@@ -346,7 +488,7 @@ async def main():
         record('broker_crash_reconciles_owned_workers_without_replay')
         tid=await active_action();docker('kill',control);docker('rm',control)
         docker(*CONTROL_LAUNCH);docker('network','connect',CONTROL_NETWORK,control);await wait_ready()
-        failed=await settle(tid);assert failed['status']=='failed' and '重启' in failed['error'],failed
+        failed=await settle(tid);assert failed['status']=='failed' and failed['error'],failed
         await drained(tid)
         assert PERSONAL_PROCESS.poll() is None and json.loads(docker('inspect',personal))[0]['State']['Running']
         record('control_crash_revokes_active_run_without_replay')
@@ -380,7 +522,9 @@ async def main():
         cid,tid=await launch('pi',case);task=await settle(tid)
         assert task['status']=='done',task.get('error')
         detail=(await client.get('/api/tasks/'+tid)).json()
-        evidence=json.dumps(detail)
+        evidence=docker('exec',control,'python','-c',
+            "import sqlite3,json,sys; db=sqlite3.connect('file:/control-state/carme.db?mode=ro',uri=True); print(json.dumps(db.execute('SELECT content FROM messages WHERE task_id=?',(sys.argv[1],)).fetchall()))",tid)
+        if case in ('output','timeout'):assert 'worker_failed' not in json.dumps(detail)
         assert ('worker_failed' in evidence if case in ('output','timeout') else 'exit=137' in evidence if case=='memory' else 'PIDS_LIMIT_EFFECTIVE' in evidence),case
         record('action_'+case+'_bound')
     cid,tid=await launch('pi','cancel')
@@ -405,7 +549,9 @@ async def main():
     record('cancel_terminates_owned_pi_action_and_descendants',{'synthetic_personal_process_survived':True,'unrelated_container_survived':True})
     for case,code in (('authfailure',401),('redirect',302)):
         cid,tid=await launch('pi',case);failed=await settle(tid)
-        assert failed['status']=='failed' and failed['error']==f'model_provider_http_{code}',failed.get('error')
+        assert failed['status']=='failed' and 'model_provider_http' not in failed['error'], failed.get('error')
+        diagnostics=[json.loads(line) for line in (home/'runtime/control/diagnostics/execution.jsonl').read_text().splitlines()]
+        assert any(r.get('task_id') == tid and r.get('status') == code for r in diagnostics)
         health=(await client.get('/api/health')).json()['execution']
         assert health['broker']=='ready' and health['pi']=='ready'
         record('model_'+case+'_reported_separately_from_docker')
@@ -415,7 +561,7 @@ async def main():
         if (await client.get('/api/health')).json()['execution']['broker']=='offline':break
         await asyncio.sleep(.2)
     cid,tid=await launch('pi','binary');failed=await settle(tid)
-    assert failed['status']=='failed' and 'container_runner_unavailable' in failed['error']
+    assert failed['status']=='failed' and 'container_runner_unavailable' not in failed['error']
     record('broker_offline_fails_without_host_fallback')
     bad_context=INSTANCE+'-unreachable'
     docker('context','create',bad_context,'--docker','host=unix://'+str(RUN/'absent-docker.sock'))
@@ -439,7 +585,10 @@ async def main():
         if (await client.get('/api/health')).json()['execution']['broker']=='ready':break
         await asyncio.sleep(.1)
     cid,tid=await launch('pi','binary');failed=await settle(tid)
-    assert failed['status']=='failed' and 'docker_operation_failed:create' in failed['error'],failed.get('error')
+    assert failed['status']=='failed' and 'docker_operation_failed' not in failed['error'],failed.get('error')
+    private_error=docker('exec',control,'python','-c',
+        "import sqlite3,sys; db=sqlite3.connect('file:/control-state/carme.db?mode=ro',uri=True); print(db.execute('SELECT error FROM tasks WHERE id=?',(sys.argv[1],)).fetchone()[0])",tid)
+    assert 'docker_operation_failed:create' in private_error
     record('missing_registered_image_fails_without_host_fallback')
     BROKER.send_signal(signal.SIGTERM);BROKER.wait(timeout=20)
     isolation['profiles']['dedicated']['image_digest']=actual_pi

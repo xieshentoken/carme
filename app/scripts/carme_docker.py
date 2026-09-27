@@ -32,7 +32,7 @@ def directory(path):
 
 
 def env(home):
-    return {'HOME':str(home),'PATH':'/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin','LANG':'en_US.UTF-8','LC_ALL':'en_US.UTF-8','PYTHONDONTWRITEBYTECODE':'1','CARME_LOAD_ENV':'0','PYTHONUNBUFFERED':'1'}
+    return {'HOME':str(home),'PATH':'/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin','LANG':'en_US.UTF-8','LC_ALL':'en_US.UTF-8','PYTHONDONTWRITEBYTECODE':'1','CARME_LOAD_ENV':'0','PYTHONUNBUFFERED':'1'}
 
 
 DAEMON_HINTS = ('Cannot connect to the Docker daemon', 'Is the docker daemon running', 'error during connect',
@@ -83,7 +83,7 @@ def install(home, *, binary='', context=''):
         if result['home']!=str(home):raise RuntimeError('installation_home_mismatch')
         return result
     real_home=Path(pwd.getpwuid(os.getuid()).pw_dir)
-    choices=[binary] if binary else [str(real_home/'.local/bin/docker'),'/opt/homebrew/bin/docker','/usr/local/bin/docker','/Applications/Docker.app/Contents/Resources/bin/docker']
+    choices=[binary] if binary else [shutil.which('docker'),str(real_home/'.local/bin/docker'),'/opt/homebrew/bin/docker','/usr/bin/docker','/usr/local/bin/docker','/Applications/Docker.app/Contents/Resources/bin/docker']
     binary=next((p for p in choices if p and Path(p).is_absolute() and os.access(p,os.X_OK)),None)
     if not binary:raise RuntimeError('未找到 Docker CLI；请先安装并启动 Docker Desktop。不会使用宿主执行。')
     selected=context or command([binary,'context','show'],home=real_home)
@@ -91,7 +91,8 @@ def install(home, *, binary='', context=''):
     endpoint=info['Endpoints']['docker']['Host']
     if not endpoint.startswith('unix:///'):raise RuntimeError('当前启动器只接受本机 Unix socket context；远程 daemon 路径尚未验收')
     config=directory(home/'docker-config');directory(home/'client-home')
-    save(config/'config.json',{'cliPluginsExtraDirs':['/Applications/Docker.app/Contents/Resources/cli-plugins']})
+    plugins='/Applications/Docker.app/Contents/Resources/cli-plugins'
+    save(config/'config.json',{'cliPluginsExtraDirs':[plugins] if Path(plugins).is_dir() else []})
     selected='carme-local'
     command([binary,'--config',str(config),'context','create',selected,'--docker','host='+endpoint],home=home/'client-home')
     result={'version':1,'id':'install-'+secrets.token_hex(8),'home':str(home),'docker':binary,'docker_config':str(config),'docker_context':selected,'source_context':context or info['Name']}
@@ -131,7 +132,7 @@ def build(setup):
         ready=load(manifest)
         if all(docker(setup,'image','inspect','--format','{{.Id}}',image,check=False)==image for image in ready['images'].values()):return ready
     images={}
-    for role in ('control','pi','action','browser'):
+    for role in ('control','pi','action','desktop'):
         print('构建 '+role+' 固定镜像…',flush=True)
         image_file=release/(role+'.id')
         docker(setup,'build','--progress=plain','--iidfile',str(image_file),'-f',str(release/'deploy/docker'/('Dockerfile.'+role)),str(release),timeout=1800,log=release/('build-'+role+'.log'))
@@ -300,9 +301,43 @@ def stop(setup, acc):
     # Only this account's Worker labels; no global prune, down -v or broad process kill.
     for cid in docker(setup,'ps','-aq','--filter','label=carme.instance='+acc['instance_id']).splitlines():
         item=inspect(setup,cid);labels=item['Config'].get('Labels') or {}
-        if labels.get('carme.instance')==acc['instance_id'] and labels.get('carme.role') in ('pi','action','browser') and re.fullmatch(r'[a-f0-9]{32}',labels.get('carme.job','')):
+        if labels.get('carme.instance')==acc['instance_id'] and ((labels.get('carme.role') in ('pi','action','browser') and re.fullmatch(r'[a-f0-9]{32}',labels.get('carme.job',''))) or (labels.get('carme.role')=='desktop' and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,95}',labels.get('carme.bot','')))):
             docker(setup,'rm','-f',cid)
     print('已停止账号 '+acc['id']+'；数据库、配置和成果已保留。',flush=True)
+
+
+def prepare_host_computer(setup, acc, isolation, source):
+    """Prepare main's explicit GUI bridge; never grants access or starts it."""
+    if acc['id'] != 'main': return
+    base = Path(acc['home']); toolchain = directory(Path(setup['home'])/'toolchains/computer-use')
+    local_bin = Path(pwd.getpwuid(os.getuid()).pw_dir)/'.local/bin'
+    node = (local_bin/'node').resolve(); npm = (local_bin/'npm').resolve()
+    if not node.is_file() or not npm.is_file(): raise RuntimeError('host_computer_requires_node_and_npm')
+    package_root = Path(source)/'deploy/docker/desktop'
+    wanted = hashlib.sha256((package_root/'package-lock.json').read_bytes()).hexdigest()
+    marker = toolchain/'installed.json'
+    for name in ('package.json','package-lock.json','computer-use.ts'): shutil.copy2(package_root/name,toolchain/name)
+    if not marker.exists() or load(marker).get('lock') != wanted:
+        command([str(node),str(npm),'ci','--ignore-scripts','--no-audit','--no-fund','--cache',str(toolchain/'npm-cache')],
+                cwd=toolchain,home=Path(setup['home'])/'client-home',timeout=900,log=toolchain/'install.log')
+        save(marker,{'lock':wanted,'version':'0.5.1'})
+    prebuilt=toolchain/'node_modules/@injaneity/pi-computer-use/prebuilt/macos/universal/pi-computer-use.app'
+    helper_sha=hashlib.sha256((prebuilt/'Contents/MacOS/bridge').read_bytes()).hexdigest()
+    helper=Path(pwd.getpwuid(os.getuid()).pw_dir)/'Applications/pi-computer-use.app'
+    if not (helper/'Contents/MacOS/bridge').is_file() or hashlib.sha256((helper/'Contents/MacOS/bridge').read_bytes()).hexdigest()!=helper_sha:
+        helper=toolchain/'pi-computer-use.app'
+        if not helper.exists(): shutil.copytree(prebuilt,helper)
+        if hashlib.sha256((helper/'Contents/MacOS/bridge').read_bytes()).hexdigest()!=helper_sha: raise RuntimeError('host_helper_version_conflict')
+    if not isolation.get('mac_runner'):
+        key=base/'runtime/secrets/mac-key'
+        if key.exists(): raise RuntimeError('unregistered_mac_pairing_key')
+        key.write_text(secrets.token_hex(32));key.chmod(0o644)
+        isolation['mac_runner']={'runner_id':'mac-'+secrets.token_hex(8),'key_file':'/run/secrets/mac-key'}
+    isolation['mac_runner']['computer_use']=True
+    state=directory(base/'runtime/mac-runner')
+    save(base/'mac-runner.json',{'account_id':'main','runner_id':isolation['mac_runner']['runner_id'],
+        'key_file':str(base/'runtime/secrets/mac-key'),'state_dir':str(state),'control_url':f'http://127.0.0.1:{acc["port"]}',
+        'computer_use':{'version':'0.5.1','node':str(node),'toolchain':str(toolchain),'helper_app':str(helper),'helper_sha256':helper_sha}})
 
 
 def start(setup, acc, release, python):
@@ -319,6 +354,13 @@ def start(setup, acc, release, python):
         docker(setup,'rm',acc['control_name'])
     if not port_available(acc['port']):raise RuntimeError('账号端口已被占用；不会停止占用端口的其他服务')
     base=Path(acc['home']);stop_broker(acc)
+    if 'desktop' in release['images']:
+        sys.path.insert(0, str(ROOT/'app'))
+        from carme.account_disk import install_chrome, migrate_browser_profiles
+        print('准备账号 '+acc['id']+' 的 2 GiB 独立电脑磁盘与 Chrome…',flush=True)
+        disk_status=install_chrome(base)
+        migrate_browser_profiles(base)
+        print('Chrome 安装后剩余 '+str(round(disk_status['free_bytes']/1024**3,2))+' GiB',flush=True)
     backup_m4(base,acc['instance_id'])
     for sub in ('config','runtime/control','runtime/artifacts','runtime/skills','runtime/secrets','runtime/credentials','runtime/broker','runtime/logs'):
         directory(base/sub)
@@ -330,7 +372,7 @@ def start(setup, acc, release, python):
     isolation=json.loads(parsed)
     if isolation.get('broker',{}).get('instance_id')!=acc['instance_id']:raise RuntimeError('broker_instance_mismatch')
     # One-time route upgrade, preserving explicitly configured Bot grants and targets.
-    if 'browser' not in isolation:
+    if 'browser' not in isolation and not isolation.get('desktop'):
         backup=directory(base/'config-backups'/('docker-browser-'+time.strftime('%Y%m%d-%H%M%S')+'-'+secrets.token_hex(3)))
         for name in ('isolation.yaml','browser.yaml','agents.yaml'):
             shutil.copy2(base/'config'/name,backup/name);(backup/name).chmod(0o600)
@@ -347,19 +389,67 @@ def start(setup, acc, release, python):
         if action and 'tools' in action:
             action['tools']=list(dict.fromkeys([*action['tools'],'browser','computer']))
         isolation['browser']={'routing_version':1}
-    isolation['browser']['image_digest']=release['images']['browser']
+    if 'browser' in release['images']:
+        isolation.setdefault('browser', {'routing_version':1})['image_digest']=release['images']['browser']
+    elif 'desktop' in release['images']:
+        isolation.pop('browser', None)
+    if 'desktop' in release['images']:
+        if not isolation.get('desktop'):
+            backup=directory(base/'config-backups'/('desktop-'+time.strftime('%Y%m%d-%H%M%S')+'-'+secrets.token_hex(3)))
+            for name in ('isolation.yaml','agents.yaml','skills.yaml'):
+                if (base/'config'/name).exists():
+                    shutil.copy2(base/'config'/name,backup/name);(backup/name).chmod(0o600)
+        for target in isolation.get('targets',{}).values():
+            if 'tools' in target: target['tools']=list(dict.fromkeys([*target['tools'],'desktop','skill']))
+        isolation['desktop']={'version':1,'image_digest':release['images']['desktop'],'usable_before_chrome':2*1024**3}
+        # The skill is an explicit Carme grant, never an auto-loaded personal Pi resource.
+        skill_code='''import sys,json,yaml,pathlib,hashlib
+from carme.skills import SkillManager
+base=pathlib.Path(sys.argv[1]); source=pathlib.Path(sys.argv[2])
+agents=yaml.safe_load((base/'config/agents.yaml').read_text())
+manager=SkillManager(root=base/'runtime/skills',settings_path=base/'config/skills.yaml')
+source_tag='carme-pinned-desktop-0.5.1:'+hashlib.sha256(source.read_bytes()).hexdigest()
+known=next((k for k,v in manager.settings().get('installed',{}).items() if v.get('source')==source_tag),None)
+skill=manager.get(known) if known else manager.install_from_text(source.read_text(),name='pi-computer-use',source=source_tag)
+revision=manager.snapshot(skill.id)['revision']
+for bot_id,spec in agents.get('agents',{}).items():
+ if spec.get('execution_target','none')=='none':
+  spec['execution_target']='container';spec['execution_target_id']='action'
+ if spec.get('execution_target')=='container':
+  spec['tools']=list(dict.fromkeys([*spec.get('tools',[]),'desktop','skill']))
+  for old,old_revision in list(manager.settings().get('grants',{}).get(bot_id,{}).items()):
+   if old!=skill.id and manager.settings().get('installed',{}).get(old,{}).get('source','').startswith('carme-pinned-desktop-'):
+    manager.grant(bot_id,old,old_revision,revoke=True)
+# Retire older managed grants, preserve their immutable task evidence.
+for old,old_revision in list(manager.settings().get('grants',{}).get('*',{}).items()):
+ if old!=skill.id and manager.settings().get('installed',{}).get(old,{}).get('source','').startswith('carme-pinned-desktop-'):
+  manager.grant('*',old,old_revision,revoke=True)
+manager.share(skill.id,revision)
+manager.migrate_shared()
+(base/'config/agents.yaml').write_text(json.dumps(agents,ensure_ascii=False,indent=2))
+(base/'config/skills.yaml').chmod(0o666)
+for path in (base/'runtime/skills').rglob('*'):
+ if not path.is_symlink():path.chmod(0o777 if path.is_dir() else 0o666)
+(base/'runtime/skills').chmod(0o777)
+print(json.dumps({'skill_id':skill.id,'skill_revision':revision}))
+'''
+        skill_info=command([python,'-B','-c',skill_code,str(base),str(Path(release['source'])/'deploy/docker/desktop/SKILL.md')],
+                home=Path(setup['home'])/'client-home',cwd=release['source'])
+        isolation['desktop'].update(json.loads(skill_info))
     target=isolation.setdefault('targets',{}).get('action')
     if target:target['image_digest']=release['images']['action']
     for profile in isolation.get('profiles',{}).values():
         if profile.get('engine')=='pi':profile['image_digest']=release['images']['pi']
+    if 'desktop' in release['images']: prepare_host_computer(setup,acc,isolation,release['source'])
     save(import_config,isolation,0o666)
     settings={'home':str(base),'instance_id':acc['instance_id'],'key_file':str(base/'runtime/secrets/broker-key'),'control_url':f'http://127.0.0.1:{acc["port"]}',
-        'docker_binary':setup['docker'],'docker_config':setup['docker_config'],'docker_context':setup['docker_context'],'images':{k:release['images'][k] for k in ('pi','action','browser')},'targets':list(isolation.get('targets',{})),'max_pi':2,'max_browser':2}
+        'docker_binary':setup['docker'],'docker_config':setup['docker_config'],'docker_context':setup['docker_context'],'images':{k:release['images'][k] for k in ('pi','action','browser','desktop') if k in release['images']},'targets':list(isolation.get('targets',{})),'max_pi':2,'max_browser':2,
+        'desktop':bool(isolation.get('desktop')),'max_desktop':2}
     save(base/'broker.json',settings)
     args=['create','--name',acc['control_name'],'--label','carme.installation='+setup['id'],'--label','carme.instance='+acc['instance_id'],'--label','carme.role=control','--pull=never',
           '--publish',f'127.0.0.1:{acc["port"]}:8899','--read-only','--user','1000:1000','--cap-drop=ALL','--security-opt=no-new-privileges:true','--pids-limit','128','--memory','768m','--cpus','1',
           '--log-driver','local','--log-opt','max-size=10m','--log-opt','max-file=3','--tmpfs','/runtime:rw,nosuid,nodev,size=128m,uid=1000,gid=1000,mode=700','--tmpfs','/tmp:rw,nosuid,nodev,noexec,size=64m,mode=1777',
-          '--env','CARME_ACCOUNT_ORIGIN='+acc['origin'],'--env','CARME_PUBLIC_ORIGIN='+acc['origin'],
+          '--env','CARME_ACCOUNT_ID='+acc['id'],'--env','CARME_ACCOUNT_ORIGIN='+acc['origin'],'--env','CARME_PUBLIC_ORIGIN='+acc['origin'],
           '--env','CARME_CREDENTIALS_DIR=/run/credentials','--env','CARME_ENV_FILE=/config/.env']
     for src,dst,ro in [('config','/config',False),('runtime/control','/control-state',False),('runtime/artifacts','/artifacts',False),('runtime/skills','/skills',False),('runtime/credentials','/run/credentials',False)]:
         args+=['--mount',f'type=bind,src={base/src},dst={dst}'+(',readonly' if ro else '')]
@@ -457,6 +547,7 @@ def status(setup, acc):
     if row['control']=='running':
         try:row['components']=api(acc,'/api/health').get('execution',{})
         except (OSError,ValueError):row['components']={'control':'unreachable'}
+        row['routes']['web']=row['components'].get('web_route', 'Docker Browser')
         row['routing_status']='active' if 'browser' in row['components'] else 'upgrade_required'
     return row
 

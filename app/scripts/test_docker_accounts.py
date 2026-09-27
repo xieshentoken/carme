@@ -2,6 +2,7 @@
 import importlib.util
 import json
 import sys
+import tempfile
 import time
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -10,7 +11,8 @@ from playwright.sync_api import sync_playwright
 spec=importlib.util.spec_from_file_location('launcher',Path(__file__).with_name('carme_docker.py'))
 cli=importlib.util.module_from_spec(spec);spec.loader.exec_module(cli)
 home=Path(sys.argv[1]);output=Path(sys.argv[2])
-assert home.resolve() == home and str(home).startswith(('/private/tmp/carme-m3-', '/private/tmp/carme-browser-', '/private/tmp/carme-m4-'))
+tmp=tempfile.gettempdir()
+assert home.resolve() == home and str(home).startswith(tuple(tmp+'/'+name for name in ('carme-m3-', 'carme-browser-', 'carme-m4-')))
 setup=cli.load(home/'installation.json')
 accounts={a['id']:a for a in cli.account_list(home)}
 a,b=accounts['alice'],accounts['bob'];checks=[]

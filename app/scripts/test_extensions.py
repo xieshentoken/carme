@@ -481,7 +481,11 @@ async def api_checks(root: Path, server_path: Path) -> None:
         installed = await client.post("/api/skills/install", json={"source": "text", "text": SKILL_TEXT})
         assert installed.status_code == 201, installed.text
         skill = installed.json()["skill"]
-        assert skill["enabled"] and skill["file_count"] == 1, skill
+        assert skill["enabled"] and skill["file_count"] == 1 and skill['shared'], skill
+        shared = runtime.skills.effective_grants('future-bot')
+        assert skill['id'] in shared
+        repeated = await client.post('/api/skills/install', json={'source': 'text', 'text': SKILL_TEXT})
+        assert repeated.json()['skill']['id'] == skill['id']
 
         listed = (await client.get("/api/skills")).json()
         assert listed["enabled"] == 1 and listed["skills"][0]["id"] == skill["id"], listed
@@ -639,7 +643,7 @@ async def _cli_bridge_check(config, runtime, store, spec, config_dir: Path, root
 
 def wiring_checks(root: Path) -> None:
     assert {"skill", "mcp"} <= set(TOOL_GROUPS), TOOL_GROUPS
-    assert TOOL_GROUPS["skill"] == ["list_skills", "use_skill"]
+    assert TOOL_GROUPS["skill"] == ["list_skills", "use_skill", "install_skill", "remove_skill"]
     assert {"list_skills", "use_skill"} <= BRIDGE_TOOL_NAMES, BRIDGE_TOOL_NAMES
 
     bridged = _bridge_tools([
@@ -682,7 +686,7 @@ def wiring_checks(root: Path) -> None:
         assert "## 你可用的技能（Skill）" in prompt and "PDF 报告" in prompt, prompt
         assert "use_skill" in prompt and "render.py" not in prompt, prompt
         names = [item["function"]["name"] for item in runtime.registry.specs_for(spec.tools)]
-        assert names == ["remember", "recall", "forget", "list_skills", "use_skill"], names
+        assert names == ["remember", "recall", "forget", "list_skills", "use_skill", "install_skill", "remove_skill"], names
         assert runtime.registry.specs_for(["mcp"]) == [], "没有连接时 mcp 分组展开为空"
 
         # 技能工具直接跑一遍：list_skills 有内容，use_skill 给正文，停用后给出明确拒绝。

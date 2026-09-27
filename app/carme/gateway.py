@@ -23,6 +23,8 @@ import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 
+from .security import password_hash, password_matches, visitor_proof, visitor_route
+
 ACCOUNT = re.compile(r"[a-z][a-z0-9_-]{0,31}\Z")
 # 入口登录会话时长：7 天。2026-09-21 由 12 小时延长到 3 天，随后按要求延长到 7 天。
 # 实际有效期还会被 Cloudflare Access 会话（请求 JWT 的 exp）截断，见 cloudflare()：
@@ -34,27 +36,6 @@ SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
 
 def digest(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
-
-
-def password_hash(password: str, salt: str | None = None) -> str:
-    if not isinstance(password, str) or not 15 <= len(password) <= 128:
-        raise ValueError("密码需要 15–128 个字符")
-    salt = salt or secrets.token_hex(16)
-    result = hashlib.scrypt(password.encode(), salt=bytes.fromhex(salt), n=2**17,
-                            r=8, p=1, maxmem=256*1024*1024, dklen=32)
-    return "scrypt$131072$8$1$" + salt + "$" + result.hex()
-
-
-def password_matches(password: str, stored: str) -> bool:
-    try:
-        if not stored.startswith("scrypt$131072$8$1$"):
-            return False
-        # Invalid lengths still incur the same expensive verification.
-        valid = isinstance(password, str) and 15 <= len(password) <= 128
-        actual = password_hash(password if valid else "invalid-password-placeholder", stored.split("$")[4])
-        return hmac.compare_digest(actual, stored) and valid
-    except (ValueError, TypeError):
-        return False
 
 
 @contextlib.contextmanager
@@ -268,18 +249,26 @@ def create_gateway(config: dict, *, transport=None) -> FastAPI:
                 raise HTTPException(403, "origin_required")
             subject, expires = await cloudflare(request)
             request.state.subject, request.state.access_expires = subject, expires
-            secret = request.cookies.get(COOKIE, "")
-            request.state.session = session_row(home, secret, subject)
-            if request.state.session:
+            if any(h.startswith('x-carme-visitor') for h in request.headers):
+                raise HTTPException(401, 'visitor_header_denied')
+            visitor_route = request.url.path.startswith('/api/visitor')
+            secret = request.cookies.get('carme_visitor' if visitor_route else COOKIE, "")
+            request.state.session = None if visitor_route else session_row(home, secret, subject)
+            if visitor_route and secret and request.method not in SAFE_METHODS:
+                if not hmac.compare_digest(request.headers.get('x-carme-csrf', '').encode(), csrf(secret).encode()):
+                    raise HTTPException(403, 'csrf_required')
+            if request.state.session and not visitor_route:
                 expected_account = request.headers.get("x-carme-account") or request.query_params.get("account")
                 if expected_account and expected_account != request.state.session["account"]:
                     raise HTTPException(409, "account_changed")
-            if request.state.session and request.method not in SAFE_METHODS:
+            if request.state.session and not visitor_route and request.method not in SAFE_METHODS:
                 if not hmac.compare_digest(request.headers.get("x-carme-csrf", "").encode(), csrf(secret).encode()):
                     raise HTTPException(403, "csrf_required")
             response = await call_next(request)
         except HTTPException as exc:
             response = JSONResponse({"detail": exc.detail}, status_code=exc.status_code, headers=exc.headers)
+        if request.url.path.startswith("/api/visitor/") and response.status_code == 401:
+            response.delete_cookie("carme_visitor", path="/api/visitor", httponly=True, secure=not local, samesite="strict")
         response.headers["Cache-Control"] = "no-store"
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-Frame-Options"] = "DENY"
@@ -293,6 +282,140 @@ def create_gateway(config: dict, *, transport=None) -> FastAPI:
         if changed and row["must_change"]:
             raise HTTPException(403, "password_change_required")
         return row
+
+    @app.api_route('/api/visitor/{account}/{operation:path}', methods=['GET', 'POST', 'DELETE', 'PUT', 'PATCH', 'HEAD', 'OPTIONS'])
+    async def visitor_auth(account: str, operation: str, request: Request):
+        route = visitor_route(request.method, request.url.path)
+        if not route:
+            raise HTTPException(403, 'visitor_route_denied')
+        def backend():
+            with database(home) as db:
+                user = db.execute('SELECT instance,enabled,version FROM users WHERE account=?', (account,)).fetchone()
+            if not user or not user['enabled']:
+                raise HTTPException(401, 'visitor_account_unavailable')
+            try:
+                acc, token = account_backend(home, account, user['instance'])
+            except (ValueError, OSError, KeyError):
+                raise HTTPException(503, 'visitor_account_unavailable') from None
+            return acc, token, user['version']
+        acc, token, version = backend()
+        body = bytearray()
+        async for chunk in request.stream():
+            body.extend(chunk)
+            if len(body) > (65536 if route[1] == 'write' else 4096):
+                raise HTTPException(413, 'request_too_large')
+        secret = request.cookies.get('carme_visitor', '')
+        if len(secret) > 128:
+            raise HTTPException(401, 'visitor_session_invalid')
+        target = request.scope['raw_path'].decode('ascii')
+        if request.scope['query_string']:
+            target += '?' + request.scope['query_string'].decode('ascii')
+        # Resolve the registered backend again immediately before forwarding.
+        if backend() != (acc, token, version) or time.time() >= request.state.access_expires:
+            raise HTTPException(401, 'visitor_account_unavailable')
+        proof = visitor_proof(token, account=account, instance=acc['instance_id'],
+            method=request.method, target=target, body=bytes(body), secret=secret,
+            subject=digest(request.state.subject), access_expires=request.state.access_expires, account_version=version)
+        if route[1] in {'read', 'write'}:
+            headers = {k: request.headers[k] for k in ('range', 'last-event-id', 'content-type') if k in request.headers}
+            headers.update({'Host': urlsplit(acc['origin']).netloc, 'X-Carme-Visitor-Proof': proof,
+                            'X-Carme-Visitor-Session': secret})
+            outgoing = app.state.client.build_request(request.method,
+                f'http://127.0.0.1:{acc["port"]}' + target, content=bytes(body), headers=headers,
+                timeout=httpx.Timeout(30, connect=5, read=None))
+            outgoing.headers.pop('cookie', None)
+            try:
+                upstream = await app.state.client.send(outgoing, stream=True)
+            except httpx.HTTPError:
+                raise HTTPException(502, 'visitor_backend_unavailable') from None
+            if upstream.status_code not in {200, 206}:
+                code = upstream.status_code if upstream.status_code in {400, 401, 403, 404, 409, 413, 415, 416, 422, 429} else 502
+                await upstream.aclose()
+                return JSONResponse({'detail': 'visitor_read_failed'}, status_code=code)
+            content_type = upstream.headers.get('content-type', '').split(';')[0]
+            if content_type not in {'application/json', 'application/octet-stream', 'image/webp', 'text/event-stream'}:
+                await upstream.aclose()
+                raise HTTPException(502, 'visitor_backend_unavailable')
+            out_headers = {k: upstream.headers[k] for k in
+                ('content-type', 'content-disposition', 'content-range', 'accept-ranges', 'content-length') if k in upstream.headers}
+            out_headers['Cache-Control'] = 'no-store'
+            out_headers['X-Content-Type-Options'] = 'nosniff'
+            if content_type == 'text/event-stream':
+                out_headers['X-Accel-Buffering'] = 'no'
+            # Transport proofs are intentionally short-lived. Reconnect with a
+            # fresh signed request; never extend an old proof inside a long stream.
+            deadline = min(time.time() + 29, request.state.access_expires)
+            async def visitor_chunks():
+                pending = None
+                iterator = upstream.aiter_bytes().__aiter__()
+                try:
+                    while time.time() < deadline:
+                        if backend() != (acc, token, version) or await request.is_disconnected():
+                            break
+                        if pending is None:
+                            pending = asyncio.create_task(anext(iterator))
+                        ready, _ = await asyncio.wait({pending}, timeout=0.5)
+                        if not ready:
+                            continue
+                        try:
+                            chunk = pending.result()
+                        except StopAsyncIteration:
+                            break
+                        pending = None
+                        if backend() != (acc, token, version) or time.time() >= deadline:
+                            break
+                        if chunk:
+                            yield chunk
+                except (HTTPException, httpx.HTTPError):
+                    return
+                finally:
+                    if pending:
+                        pending.cancel()
+                        await asyncio.gather(pending, return_exceptions=True)
+                    await upstream.aclose()
+            from starlette.background import BackgroundTask
+            return StreamingResponse(visitor_chunks(), status_code=upstream.status_code, headers=out_headers,
+                                     background=BackgroundTask(upstream.aclose))
+        try:
+            reply = await app.state.client.request(request.method,
+                f'http://127.0.0.1:{acc["port"]}' + target, content=bytes(body),
+                headers={'Host': urlsplit(acc['origin']).netloc,
+                    'Content-Type': request.headers.get('content-type', ''),
+                    'X-Carme-Visitor-Proof': proof, 'X-Carme-Visitor-Session': secret})
+            data = reply.json()
+        except (httpx.HTTPError, ValueError):
+            raise HTTPException(502, 'visitor_backend_unavailable') from None
+        if backend() != (acc, token, version) or time.time() >= request.state.access_expires:
+            raise HTTPException(401, 'visitor_account_unavailable')
+        if reply.status_code != 200:
+            # Never relay arbitrary backend error bodies or headers to a visitor.
+            code = reply.status_code if reply.status_code in {400, 401, 403, 413, 415, 429} else 502
+            return JSONResponse({'detail': 'visitor_auth_failed'}, status_code=code,
+                headers={'Retry-After': '900'} if code == 429 else None)
+        if not isinstance(data, dict) or data.get('ok') is not True:
+            raise HTTPException(502, 'visitor_backend_unavailable')
+        result = {'ok': True, 'auth_mode': 'visitor'}
+        if request.method != 'DELETE':
+            session = data.get('session')
+            fields = ('id', 'visitor_id', 'conversation_id', 'username', 'display_name',
+                      'membership_version', 'created_at', 'expires_at')
+            if not isinstance(session, dict) or any(k not in session for k in fields):
+                raise HTTPException(502, 'visitor_backend_unavailable')
+            result['session'] = {k: session[k] for k in fields}
+            if operation == 'login':
+                secret = data.get('secret', '')
+                if not isinstance(secret, str) or not re.fullmatch(r'[A-Za-z0-9_-]{43}', secret):
+                    raise HTTPException(502, 'visitor_backend_unavailable')
+            result['csrf'] = csrf(secret)
+        response = JSONResponse(result)
+        if operation == 'login':
+            ttl = max(0, int(min(result['session']['expires_at'], request.state.access_expires) - time.time()))
+            response.set_cookie('carme_visitor', secret, max_age=ttl, httponly=True,
+                                secure=not local, samesite='strict', path='/api/visitor')
+        elif request.method == 'DELETE':
+            response.delete_cookie('carme_visitor', path='/api/visitor', httponly=True,
+                                   secure=not local, samesite='strict')
+        return response
 
     @app.post("/api/login")
     async def login(request: Request):
@@ -399,6 +522,15 @@ def create_gateway(config: dict, *, transport=None) -> FastAPI:
         html = (web / "index.html").read_text().replace("<html ", '<html data-carme-account="'+row["account"]+'" ', 1)
         return HTMLResponse(html)
 
+    @app.get('/visit/{account}/{conversation_id}')
+    async def visitor_page(account: str, conversation_id: str):
+        # Access middleware still applies. The shell contains no identity or credential.
+        if not ACCOUNT.fullmatch(account) or not re.fullmatch(r'c_[a-f0-9]+', conversation_id):
+            raise HTTPException(404, 'visitor_entry_missing')
+        if not (web / 'index.html').is_file():
+            raise HTTPException(503, '网页尚未构建')
+        return HTMLResponse((web / 'index.html').read_text())
+
     @app.get("/account")
     async def account_page(request: Request):
         if not request.state.session:
@@ -407,6 +539,8 @@ def create_gateway(config: dict, *, transport=None) -> FastAPI:
 
     @app.api_route("/api/{path:path}", methods=["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"])
     async def proxy(path: str, request: Request):
+        if path.startswith('visitor'):
+            raise HTTPException(403, 'visitor_route_denied')
         row = require(request)
         if path in {"session", "login", "password", "sessions"} or path.startswith("sessions/"):
             raise HTTPException(405, "method_not_allowed")
@@ -423,7 +557,7 @@ def create_gateway(config: dict, *, transport=None) -> FastAPI:
                 raise HTTPException(413, "请求过大")
         if not session_row(home, request.cookies[COOKIE], request.state.subject) or time.time() >= request.state.access_expires:
             raise HTTPException(401, "password_login_required")
-        headers = {k: request.headers[k] for k in ("content-type", "accept", "range", "last-event-id") if k in request.headers}
+        headers = {k: request.headers[k] for k in ("content-type", "accept", "range", "last-event-id", "x-carme-desktop-control") if k in request.headers}
         headers.update({"Authorization": "Bearer "+token, "Host": urlsplit(acc["origin"]).netloc})
         url = httpx.URL(scheme="http", host="127.0.0.1", port=acc["port"],
                         raw_path=request.scope["raw_path"] + (b"?"+request.scope["query_string"] if request.scope["query_string"] else b""))
@@ -439,16 +573,21 @@ def create_gateway(config: dict, *, transport=None) -> FastAPI:
         if 300 <= upstream.status_code < 400:
             await upstream.aclose()
             raise HTTPException(502, "backend_redirect_denied")
-        out_headers = {k: upstream.headers[k] for k in ("content-type", "content-disposition", "content-range", "accept-ranges") if k in upstream.headers}
+        out_headers = {k: upstream.headers[k] for k in ("content-type", "content-disposition", "content-range", "accept-ranges", "x-carme-bot", "x-screenshot-mtime", "x-carme-desktop-target", "x-carme-desktop-state") if k in upstream.headers}
+        events = upstream.headers.get("content-type", "").split(";", 1)[0] == "text/event-stream"
+        if events:
+            out_headers["X-Accel-Buffering"] = "no"
         secret, subject = request.cookies[COOKIE], request.state.subject
 
         async def stream():
             pending = None
-            deadline = min(time.time()+120, row["expires_at"], request.state.access_expires)
+            deadline = min(row["expires_at"], request.state.access_expires)
+            if not events:
+                deadline = min(deadline, time.time()+120)
             iterator = upstream.aiter_bytes().__aiter__()
             try:
                 while time.time() < deadline:
-                    if not session_row(home, secret, subject):
+                    if await request.is_disconnected() or not session_row(home, secret, subject):
                         break
                     if pending is None:
                         pending = asyncio.create_task(anext(iterator))
@@ -558,7 +697,8 @@ def main():
     # keep-alive 必须长于 cloudflared 的源站池（默认 90 秒），否则复用到已被本进程关闭的连接会得到
     # connection reset，Cloudflare 直接渲染 502（隧道日志里的 Unable to reach the origin）。
     uvicorn.run(create_gateway(config), host="127.0.0.1", port=config["port"],
-                access_log=False, proxy_headers=False, log_level="warning", timeout_keep_alive=120)
+                access_log=False, proxy_headers=False, log_level="warning", timeout_keep_alive=120,
+                timeout_graceful_shutdown=5)
 
 
 if __name__ == "__main__":

@@ -42,7 +42,7 @@ from ..engines import CLI_ENGINE_DEFS, ENGINE_MODEL_PATTERN, PI_PACKAGE, PI_VERS
 log = logging.getLogger("carme.api")
 
 WEB_DIR = Path(__file__).resolve().parent.parent.parent / "web"
-CLOUDFLARE_ORIGIN = "http://127.0.0.1:8899"
+CLOUDFLARE_ORIGIN = os.getenv("CARME_CLOUDFLARE_ORIGIN", "http://127.0.0.1:8899")
 CLOUDFLARE_CONFIG_DEFAULT = WEB_DIR.parent / "deploy" / "cloudflared" / "carme-tunnel.yml"
 CLOUDFLARE_PID_DEFAULT = WEB_DIR.parent / ".local" / "active" / "cloudflared.pid"
 
@@ -67,11 +67,14 @@ class ProbeRequest(BaseModel):
 class DesktopControl(BaseModel):
     model_config = ConfigDict(extra="forbid")
     enabled: bool
+    control_id: str = Field('', max_length=128)
 
 
 class DesktopKeyboard(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    keys: str = Field(..., min_length=1, max_length=24)
+    keys: str = Field('', max_length=80)
+    text: str = Field('', max_length=4096)
+    control_id: str = Field('', max_length=128)
 
 
 class DesktopMouse(BaseModel):
@@ -84,6 +87,7 @@ class DesktopMouse(BaseModel):
     button: Literal["left", "right", "middle"] = "left"
     clicks: int = Field(1, ge=1, le=3)
     delta_y: float | None = None
+    control_id: str = Field('', max_length=128)
 
 
 class ApprovalDecision(BaseModel):
@@ -94,6 +98,18 @@ class ApprovalDecision(BaseModel):
 class NewConversation(BaseModel):
     agent_ids: list[str] = Field(..., min_length=1, max_length=6)
     title: str = Field("", max_length=120)
+
+
+class ConversationPurge(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    conversation_ids: list[str] = Field(min_length=1, max_length=5000)
+
+
+class ConversationMembers(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    agent_ids: list[str] = Field(min_length=1, max_length=6)
+    expected_revision: int = Field(ge=0)
+    stop_tasks: bool = False
 
 
 class ConversationUpdate(BaseModel):
@@ -113,9 +129,11 @@ class ModelRouting(BaseModel):
 
 
 class ConversationMessage(BaseModel):
+    mode: Literal['task', 'message'] = 'task'
     content: str = Field(..., min_length=1, max_length=20000)
     request_id: str = Field(..., min_length=1, max_length=128)
     agent_id: str | None = None
+    agent_ids: list[str] | None = Field(None, min_length=1, max_length=6)
     project_snapshot: dict | None = None
     envelope: dict | None = None
     attachment_ids: list[str] = Field(default_factory=list, max_length=4)
@@ -260,9 +278,35 @@ def normalise_model_url(value: str, api_type: str) -> str:
     return urlunsplit((parts.scheme, parts.netloc, path, "", ""))
 
 
+def public_message(message: dict) -> dict:
+    # Preserve historical records in SQLite while hiding generated failure diagnostics.
+    if message.get('role') in {'assistant', 'system'} and str(message.get('content', '')).startswith(('执行失败：', '任务未完成：')):
+        from ..security import TASK_INTERRUPTED
+        return {**message, 'content': TASK_INTERRUPTED}
+    if message.get('role') == 'tool' and str(message.get('content', '')).startswith((
+            '[工具异常]', '[工具参数错误]', '[抓取失败]', '[搜索失败]', '[抓取来源暂不可用]',
+            '[搜索来源暂不可用]', '[下载来源暂不可用]', '[权限拒绝]', '[任务即将截止]')):
+        return {**message, 'content': '这一步暂未完成，Bot 将根据执行结果继续处理。'}
+    return message
+
+
+def public_event(event: dict) -> dict:
+    from ..security import TASK_INTERRUPTED
+    if event['type'] == 'task.failed':
+        return {**event, 'payload': {**event['payload'], 'error': TASK_INTERRUPTED}}
+    if event['type'] == 'task.finished' and event['payload'].get('status') == 'failed':
+        return {**event, 'payload': {**event['payload'], 'preview': TASK_INTERRUPTED}}
+    return event
+
+
 def public_task(task: dict) -> dict:
     """API 不公开任务固定的 SSH 连接快照。"""
     row = dict(task)
+    if row.get('error'):
+        from ..security import TASK_INTERRUPTED
+        row['error'] = TASK_INTERRUPTED
+        if str(row.get('result', '')).startswith(('执行失败：', '任务未完成：')):
+            row['result'] = TASK_INTERRUPTED
     try:
         meta = json.loads(row.get("meta") or "{}")
     except (TypeError, json.JSONDecodeError):
@@ -521,7 +565,7 @@ def _cloudflare_snapshot() -> dict:
     elif not token_configured:
         base.update(state="carme_auth_required",
                     message="固定入口尚未可上线：Carme 的 CARME_TOKEN 未配置。先配置并重启现有 8899 服务，再启动隧道。",
-                    next_steps=["在 WBAI/.local/active/.env 设置 CARME_TOKEN（不要粘贴到聊天或 URL），重启现有 Carme 服务。",
+                    next_steps=["在 app/.local/active/.env 设置 CARME_TOKEN（不要粘贴到聊天或 URL），重启现有 Carme 服务。",
                                 "在 Cloudflare Access 仅允许你的账号/邮箱，然后用受限邮箱实际登录测试。"])
     elif running != "running":
         base.update(state="tunnel_not_running", message="本地配置和 Carme 鉴权已具备，但 cloudflared 隧道当前没有运行。",
@@ -554,8 +598,56 @@ def _local_development(request: Request) -> bool:
                         ("forwarded", "x-forwarded-for", "x-forwarded-host", "x-forwarded-proto", "cf-connecting-ip")))
 
 
+async def require_visitor(request: Request, token: str) -> None:
+    from ..security import verify_visitor_proof, visitor_route
+    # Dedicated protocol is checked before owner/dev authentication, using
+    # a shared explicit allowlist; owner APIs never inherit this identity.
+    if request.query_params.get('token') or (request.headers.get('origin') and request.headers['origin'] != _request_origin(request)):
+        raise HTTPException(403, 'visitor_origin_denied')
+    match = visitor_route(request.method, request.url.path)
+    if not match:
+        raise HTTPException(403, 'visitor_route_denied')
+    if request.headers.get('authorization') or request.cookies.get('carme_visitor'):
+        raise HTTPException(401, 'visitor_transport_required')
+    body = bytearray()
+    async for chunk in request.stream():
+        body.extend(chunk)
+        if len(body) > (65536 if match[1] == 'write' else 4096):
+            raise HTTPException(413, 'request_too_large')
+    request._body = bytes(body)
+    config = request.app.state.config
+    account = os.getenv('CARME_ACCOUNT_ID', '')
+    instance = config.isolation.get('broker', {}).get('instance_id', '')
+    secret = request.headers.get('x-carme-visitor-session', '')
+    target = request.scope['raw_path'].decode('ascii')
+    if request.scope['query_string']:
+        target += '?' + request.scope['query_string'].decode('ascii')
+    try:
+        if account != match[0] or len(secret) > 128:
+            raise ValueError()
+        claims = verify_visitor_proof(request.headers.get('x-carme-visitor-proof', ''), token,
+            account=account, instance=instance, method=request.method, target=target,
+            body=bytes(body), secret=secret)
+    except (ValueError, UnicodeError):
+        raise HTTPException(401, 'visitor_transport_denied') from None
+    request.state.visitor_claims = claims
+    request.state.visitor_secret = secret
+    request.state.auth_kind = 'visitor'
+    if match[1] != 'login':
+        session = request.app.state.store.visitor_session(secret, claims['sub'], token + ':' + str(claims['account_version']))
+        if not session:
+            raise HTTPException(401, 'visitor_session_expired_or_revoked')
+        request.state.visitor_session = session
+        request.state.actor_key = f"visitor:{session['visitor_id']}:{session['membership_version']}"
+
+
 async def require_token(request: Request) -> None:
     expected = os.getenv("CARME_TOKEN", "").strip()
+    if (request.url.path.startswith('/api/visitor')
+            or any(h.startswith('x-carme-visitor') for h in request.headers)
+            or request.cookies.get('carme_visitor')):
+        await require_visitor(request, expected)
+        return
     origin = request.headers.get("origin")
     if origin and origin != _request_origin(request):
         raise HTTPException(403, "origin_denied")
@@ -621,6 +713,425 @@ def build_router(config: Config, store: Store, runtime: Runtime) -> APIRouter:
     model_probes: dict[str, dict] = {}
     model_save_gate = asyncio.Lock()
     avatar_dir = store.path.parent / "avatars"
+
+    visitor_hashing = asyncio.Semaphore(2)
+    # Valid verifier structure preserves expensive work for unknown usernames.
+    visitor_dummy = 'scrypt$131072$8$1$' + '0' * 32 + '$' + '0' * 64
+
+    @router.post('/visitor/{account}/login')
+    async def visitor_login(account: str, request: Request):
+        from ..security import password_matches
+        await require_token(request)
+        if request.headers.get('content-type', '').split(';')[0] != 'application/json':
+            raise HTTPException(415, 'json_required')
+        try:
+            data = await request.json()
+            if not isinstance(data, dict):
+                raise ValueError()
+            username, password, conversation = (data.get(k, '') for k in ('username', 'password', 'conversation_id'))
+            if not all(isinstance(v, str) for v in (username, password, conversation)) or len(username) > 128 or len(conversation) > 128:
+                raise ValueError()
+        except (ValueError, TypeError):
+            raise HTTPException(400, 'invalid_login_request') from None
+        claims = request.state.visitor_claims
+        if store.visitor_login_throttle(username, claims['sub']):
+            raise HTTPException(429, 'visitor_login_rate_limited', headers={'Retry-After': '900'})
+        credential = store.visitor_credential(username)
+        async with visitor_hashing:
+            valid = await asyncio.to_thread(password_matches, password,
+                credential['password_hash'] if credential else visitor_dummy)
+        if not valid or not credential or conversation != credential['conversation_id']:
+            raise HTTPException(401, 'visitor_login_denied')
+        try:
+            secret, session = store.issue_visitor_session(credential, claims['sub'],
+                os.getenv('CARME_TOKEN', '').strip() + ':' + str(claims['account_version']),
+                claims['access_exp'], request.state.visitor_secret)
+        except ValueError:
+            raise HTTPException(401, 'visitor_login_denied') from None
+        # Internal, signed-hop response only. Gateway consumes the secret into an
+        # HttpOnly cookie; it must never appear in the browser response JSON.
+        return JSONResponse({'ok': True, 'secret': secret, 'session': session}, headers={'Cache-Control': 'no-store'})
+
+    @router.get('/visitor/{account}/session')
+    async def visitor_current_session(account: str, request: Request):
+        await require_token(request)
+        return JSONResponse({'ok': True, 'session': request.state.visitor_session}, headers={'Cache-Control': 'no-store'})
+
+    @router.delete('/visitor/{account}/session')
+    async def visitor_logout(account: str, request: Request):
+        await require_token(request)
+        store.revoke_visitor_session(request.state.visitor_secret)
+        return JSONResponse({'ok': True}, headers={'Cache-Control': 'no-store'})
+
+    visitor_streams: dict[str, int] = {}
+
+    def visitor_context(request: Request, conversation_id: str):
+        claims = request.state.visitor_claims
+        if time.time() >= min(claims['exp'], claims['access_exp']):
+            raise HTTPException(401, 'visitor_transport_expired')
+        try:
+            return store.visitor_scope(request.state.visitor_secret, claims['sub'],
+                os.getenv('CARME_TOKEN', '').strip() + ':' + str(claims['account_version']), conversation_id)
+        except ValueError:
+            raise HTTPException(404, 'visitor_scope_denied') from None
+
+    def visitor_group(group: dict, account: str) -> dict:
+        members = [{'kind': 'owner', 'id': 'owner', 'name': '群主'}]
+        for aid in group['agent_ids']:
+            try:
+                spec = config.agents.get(aid)
+            except (AttributeError, KeyError):
+                spec = None
+            member = {'kind': 'bot', 'id': aid, 'name': spec.name if spec else aid}
+            avatar = spec.avatar if spec and isinstance(spec.avatar, dict) else {}
+            if avatar.get('kind') == 'image' and re.fullmatch(r'[a-f0-9]{32}\.webp', str(avatar.get('file', ''))):
+                member['avatar_url'] = f'/api/visitor/{account}/conversations/{group["id"]}/avatars/{aid}'
+            elif (avatar.get('kind') == 'bot' and avatar.get('shape') in AVATAR_SHAPES
+                    and re.fullmatch(r'#[0-9a-fA-F]{6}', str(avatar.get('color', '')))):
+                member['avatar'] = {k: avatar[k] for k in ('kind', 'shape', 'color')}
+            members.append(member)
+        members.extend({'kind': 'visitor', 'id': v['id'], 'name': v['display_name']}
+            for v in store._query('SELECT id,display_name FROM visitors WHERE conversation_id=? AND enabled=1 ORDER BY created_at', (group['id'],)))
+        return {'id': group['id'], 'title': group['title'], 'members': members, 'access_revision':group['access_revision']}
+
+    @router.get('/visitor/{account}/conversations')
+    async def visitor_conversations(account: str, request: Request):
+        await require_token(request)
+        with store.transaction():
+            group, _, _ = visitor_context(request, request.state.visitor_session['conversation_id'])
+            return JSONResponse({'conversations': [visitor_group(group, account)]}, headers={'Cache-Control': 'no-store'})
+
+    @router.get('/visitor/{account}/conversations/{conversation_id}')
+    async def visitor_conversation(account: str, conversation_id: str, request: Request):
+        await require_token(request)
+        with store.transaction():
+            group, _, _ = visitor_context(request, conversation_id)
+            return JSONResponse({'conversation': visitor_group(group, account)}, headers={'Cache-Control': 'no-store'})
+
+    @router.post('/visitor/{account}/conversations/{conversation_id}/messages')
+    async def visitor_send_message(account: str, conversation_id: str, request: Request):
+        await require_token(request)
+        if request.headers.get('content-type', '').split(';')[0] != 'application/json':
+            raise HTTPException(415, 'json_required')
+        try:
+            data = await request.json()
+            if not isinstance(data, dict) or set(data) - {'content', 'request_id', 'mode'}:
+                raise ValueError()
+            content, request_id, mode = data.get('content'), data.get('request_id'), data.get('mode', 'task')
+            if (not isinstance(content, str) or not isinstance(request_id, str)
+                    or not content.strip() or not request_id.strip() or len(content) > 20000 or len(request_id) > 128
+                    or mode not in {'message', 'task'}):
+                raise ValueError()
+        except (ValueError, TypeError):
+            raise HTTPException(422, 'visitor_message_invalid') from None
+        if mode == 'task':
+            visitor_context(request, conversation_id)
+            try:
+                result = await runtime.submit_message(conversation_id, content, request_id,
+                    actor_key=request.state.actor_key, authorize=lambda: visitor_context(request, conversation_id))
+            except (ValueError, KeyError) as exc:
+                raise HTTPException(429 if str(exc) == 'visitor_task_rate_limited' else 409, 'visitor_task_not_accepted') from None
+            return JSONResponse(result, headers={'Cache-Control': 'no-store'})
+        with store.transaction():
+            visitor_context(request, conversation_id)
+            try:
+                result = store.create_human_message(conversation_id, content, request_id,
+                    actor_key=request.state.actor_key)
+            except ValueError as exc:
+                if str(exc) == 'visitor_message_rate_limited':
+                    raise HTTPException(429, 'visitor_message_rate_limited') from None
+                raise HTTPException(409, 'visitor_message_conflict') from None
+        if result['created']:
+            # Persistence and its event are atomic; the bus only wakes readers.
+            await runtime.bus.publish({'type': 'conversation.message', 'payload': {'conversation_id': conversation_id,
+                'message_id': result['message_id']}})
+        return JSONResponse(result, headers={'Cache-Control': 'no-store'})
+
+    def visitor_invite_path(conversation_id):
+        account = os.getenv('CARME_ACCOUNT_ID', '')
+        if not re.fullmatch(r'[a-z][a-z0-9_-]{0,31}', account):
+            raise HTTPException(503, 'visitor_account_unavailable')
+        return '/visit/' + account + '/' + conversation_id
+
+    @router.get('/conversations/{conversation_id}/visitors')
+    async def owner_visitors(conversation_id: str, request: Request):
+        await require_token(request)
+        group = store.get_conversation(conversation_id)
+        if not group or group['kind'] != 'group' or group['deleted_at']:
+            raise HTTPException(404, 'visitor_group_missing')
+        rows = store._query('SELECT id FROM visitors WHERE conversation_id=? ORDER BY created_at', (conversation_id,))
+        return JSONResponse({'visitors':[store.get_visitor(conversation_id,row['id']) for row in rows],
+            'revision':group['access_revision'], 'invite_path':visitor_invite_path(conversation_id)}, headers={'Cache-Control':'no-store'})
+
+    @router.post('/conversations/{conversation_id}/visitors')
+    async def create_visitor(conversation_id: str, request: Request):
+        from ..security import new_visitor_password
+        await require_token(request)
+        invite_path = visitor_invite_path(conversation_id)
+        try:
+            data = await request.json()
+            if (not isinstance(data,dict) or set(data) != {'display_name','expected_revision'}
+                    or not isinstance(data['display_name'],str) or not 1 <= len(data['display_name'].strip()) <= 80
+                    or type(data['expected_revision']) is not int):
+                raise ValueError()
+        except (ValueError,TypeError):
+            raise HTTPException(422,'visitor_change_invalid') from None
+        async with visitor_hashing:
+            password, verifier = await asyncio.to_thread(new_visitor_password)
+        try:
+            result = await runtime.update_visitor(conversation_id, '', 'create', display_name=data['display_name'],
+                password_hash=verifier, actor_key='owner', expected_revision=data['expected_revision'])
+        except ValueError:
+            raise HTTPException(409,'visitor_change_conflict') from None
+        return JSONResponse({'visitor':result,'password':password,'invite_path':invite_path}, headers={'Cache-Control':'no-store'})
+
+    @router.patch('/conversations/{conversation_id}/visitors/{visitor_id}')
+    async def change_visitor(conversation_id: str, visitor_id: str, request: Request):
+        from ..security import new_visitor_password
+        await require_token(request)
+        if getattr(request.state, 'auth_kind', 'owner') == 'visitor':
+            raise HTTPException(403, 'owner_required')
+        try:
+            data = await request.json()
+        except ValueError:
+            raise HTTPException(422, 'visitor_change_invalid') from None
+        if (not isinstance(data, dict) or set(data) - {'action','expected_revision','allow_history'}
+                or data.get('action') not in {'remove','history','reset_password','reinvite'} or type(data.get('expected_revision')) is not int):
+            raise HTTPException(422, 'visitor_change_invalid')
+        password = None
+        kwargs = {'allow_history':data.get('allow_history')}
+        if data['action'] in {'reset_password','reinvite'}:
+            async with visitor_hashing:
+                password, kwargs['password_hash'] = await asyncio.to_thread(new_visitor_password)
+        try:
+            result = await runtime.update_visitor(conversation_id, visitor_id, data['action'], actor_key='owner',
+                expected_revision=data['expected_revision'], **kwargs)
+        except ValueError:
+            raise HTTPException(409, 'visitor_change_conflict') from None
+        return JSONResponse({'visitor':result, **({'password':password} if password else {})}, headers={'Cache-Control':'no-store'})
+
+    @router.get('/visitor/{account}/conversations/{conversation_id}/messages')
+    async def visitor_message_list(account: str, conversation_id: str, request: Request, after: int = 0, limit: int = 50):
+        await require_token(request)
+        if not 0 <= after <= 2**63-1 or not 1 <= limit <= 100:
+            raise HTTPException(400, 'visitor_pagination_invalid')
+        with store.transaction():
+            _, _, cutoff = visitor_context(request, conversation_id)
+            rows = store.visitor_messages(conversation_id, cutoff, after=after, limit=limit)
+            return JSONResponse({'messages': [public_message(row) for row in rows], 'next_after': rows[-1]['publication_seq'] if rows else max(after, cutoff)},
+                                headers={'Cache-Control': 'no-store'})
+
+    @router.get('/visitor/{account}/conversations/{conversation_id}/messages/{message_id}')
+    async def visitor_message_detail(account: str, conversation_id: str, message_id: str, request: Request):
+        await require_token(request)
+        with store.transaction():
+            _, _, cutoff = visitor_context(request, conversation_id)
+            rows = store.visitor_messages(conversation_id, cutoff, message_id=message_id)
+            if not rows:
+                raise HTTPException(404, 'visitor_message_missing')
+            return JSONResponse({'message': public_message(rows[0])}, headers={'Cache-Control': 'no-store'})
+
+    @router.get('/visitor/{account}/conversations/{conversation_id}/tasks/{task_id}')
+    async def visitor_task_detail(account: str, conversation_id: str, task_id: str, request: Request):
+        await require_token(request)
+        with store.transaction():
+            _, _, cutoff = visitor_context(request, conversation_id)
+            task = store.visitor_task(conversation_id, cutoff, task_id)
+            if not task:
+                raise HTTPException(404, 'visitor_task_missing')
+            return JSONResponse({'task': task}, headers={'Cache-Control': 'no-store'})
+
+    @router.get('/visitor/{account}/conversations/{conversation_id}/attachments/{file_id}')
+    async def visitor_file_detail(account: str, conversation_id: str, file_id: str, request: Request):
+        await require_token(request)
+        with store.transaction():
+            _, _, cutoff = visitor_context(request, conversation_id)
+            file = store.visitor_attachment(conversation_id, cutoff, file_id)
+            if not file:
+                raise HTTPException(404, 'visitor_file_missing')
+            return JSONResponse({'file': {k: file[k] for k in ('id', 'name', 'mime', 'size', 'kind')}},
+                                headers={'Cache-Control': 'no-store'})
+
+    def visitor_stream_slot(visitor_id: str):
+        # Stable identity, not session: repeated logins cannot multiply the budget.
+        if visitor_streams.get(visitor_id, 0) >= 2 or sum(visitor_streams.values()) >= 12:
+            raise HTTPException(429, 'visitor_stream_limit')
+        visitor_streams[visitor_id] = visitor_streams.get(visitor_id, 0) + 1
+        released = False
+        def release():
+            nonlocal released
+            if not released:
+                released = True
+                visitor_streams[visitor_id] -= 1
+                if not visitor_streams[visitor_id]:
+                    del visitor_streams[visitor_id]
+        return release
+
+    async def visitor_download(request: Request, conversation_id: str, *, file_id: str = '', bot_id: str = ''):
+        from ..attachments import file_path
+        from starlette.background import BackgroundTask
+        import stat
+        def checked_file():
+            with store.transaction():
+                group, visitor, cutoff = visitor_context(request, conversation_id)
+                if file_id:
+                    file = store.visitor_attachment(conversation_id, cutoff, file_id)
+                    if not file:
+                        raise HTTPException(404, 'visitor_file_missing')
+                    path = file_path(store, file_id)
+                    identity = (file['message_id'], file['sha256'], file['size'], file['name'])
+                    return path, identity, file['sha256'], group['access_revision'], visitor['id']
+                if bot_id not in group['agent_ids']:
+                    raise HTTPException(404, 'visitor_avatar_missing')
+                try:
+                    avatar = config.agents.get(bot_id).avatar
+                    name = avatar.get('file', '')
+                    if avatar.get('kind') != 'image' or not re.fullmatch(r'[a-f0-9]{32}\.webp', name):
+                        raise ValueError()
+                except (AttributeError, KeyError, ValueError, TypeError):
+                    raise HTTPException(404, 'visitor_avatar_missing') from None
+                return avatar_dir / name, (name,), '', group['access_revision'], visitor['id']
+        original = checked_file()
+        path, identity, expected_hash, epoch, vid = original
+        if path.resolve() != path or not path.is_file():
+            raise HTTPException(404, 'visitor_file_missing')
+        release = visitor_stream_slot(vid)
+        handle = None
+        try:
+            handle = path.open('rb')
+            info = os.fstat(handle.fileno())
+            if not stat.S_ISREG(info.st_mode):
+                raise HTTPException(404, 'visitor_file_missing')
+            if expected_hash:
+                actual = await asyncio.to_thread(lambda: hashlib.file_digest(handle, 'sha256').hexdigest())
+                if actual != expected_hash:
+                    raise HTTPException(409, 'artifact_version_conflict')
+                handle.seek(0)
+            if checked_file() != original:
+                raise HTTPException(404, 'visitor_file_changed')
+            size, start, end = info.st_size, 0, info.st_size-1
+            range_value = request.headers.get('range', '')
+            if range_value:
+                match = re.fullmatch(r'bytes=(\d*)-(\d*)', range_value)
+                if not match or not any(match.groups()) or not size:
+                    raise HTTPException(416, 'range_invalid')
+                a, b = match.groups()
+                if not a:
+                    if int(b) <= 0:
+                        raise HTTPException(416, 'range_invalid')
+                    start = max(0, size-int(b))
+                else:
+                    start = int(a)
+                    end = min(int(b), end) if b else end
+                if start > end or start >= size:
+                    raise HTTPException(416, 'range_invalid')
+            handle.seek(start)
+            headers = {'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff', 'Accept-Ranges': 'bytes',
+                       'Content-Length': str(max(0, end-start+1))}
+            if file_id:
+                from urllib.parse import quote
+                headers['Content-Disposition'] = "attachment; filename*=UTF-8''" + quote(identity[3], safe='')
+            if range_value:
+                headers['Content-Range'] = f'bytes {start}-{end}/{size}'
+            async def chunks():
+                remaining = max(0, end-start+1)
+                try:
+                    while remaining:
+                        if checked_file() != original or await request.is_disconnected():
+                            break
+                        chunk = await asyncio.to_thread(handle.read, min(32768, remaining))
+                        if checked_file() != original or os.fstat(handle.fileno()).st_mtime_ns != info.st_mtime_ns:
+                            break
+                        if not chunk:
+                            break
+                        remaining -= len(chunk)
+                        yield chunk
+                except (HTTPException, OSError, ValueError):
+                    return
+                finally:
+                    handle.close()
+                    release()
+            async def cleanup():
+                handle.close()
+                release()
+            return StreamingResponse(chunks(), status_code=206 if range_value else 200,
+                media_type='application/octet-stream' if file_id else 'image/webp', headers=headers,
+                background=BackgroundTask(cleanup))
+        except BaseException:
+            if handle:
+                handle.close()
+            release()
+            raise
+
+    @router.get('/visitor/{account}/conversations/{conversation_id}/attachments/{file_id}/download')
+    async def visitor_file_download(account: str, conversation_id: str, file_id: str, request: Request):
+        await require_token(request)
+        return await visitor_download(request, conversation_id, file_id=file_id)
+
+    @router.get('/visitor/{account}/conversations/{conversation_id}/avatars/{bot_id}')
+    async def visitor_avatar(account: str, conversation_id: str, bot_id: str, request: Request):
+        await require_token(request)
+        return await visitor_download(request, conversation_id, bot_id=bot_id)
+
+    @router.get('/visitor/{account}/conversations/{conversation_id}/events')
+    async def visitor_events(account: str, conversation_id: str, request: Request, after_id: int = 0):
+        from starlette.background import BackgroundTask
+        await require_token(request)
+        try:
+            cursor = max(after_id, int(request.headers.get('last-event-id', '0')))
+        except ValueError:
+            raise HTTPException(400, 'visitor_cursor_invalid') from None
+        if after_id < 0 or not 0 <= cursor <= 2**63-1:
+            raise HTTPException(400, 'visitor_cursor_invalid')
+        with store.transaction():
+            group, visitor, _ = visitor_context(request, conversation_id)
+            epoch = group['access_revision']
+            release = visitor_stream_slot(visitor['id'])
+        async def stream():
+            nonlocal cursor
+            try:
+                yield ': connected\n\n'
+                while not await request.is_disconnected():
+                    with store.transaction():
+                        group, _, cutoff = visitor_context(request, conversation_id)
+                        if group['access_revision'] != epoch:
+                            return
+                        batch = store.list_events(after_id=cursor, limit=100)
+                    for event in batch:
+                        with store.transaction():
+                            group, _, cutoff = visitor_context(request, conversation_id)
+                            if group['access_revision'] != epoch:
+                                return
+                            cursor = event['id']
+                            data = None
+                            payload = event.get('payload')
+                            if event['type'] == 'conversation.message' and isinstance(payload, dict) and payload.get('conversation_id') == conversation_id:
+                                mid = payload.get('message_id')
+                                if isinstance(mid, str) and mid:
+                                    rows = store.visitor_messages(conversation_id, cutoff, message_id=mid)
+                                    if rows:
+                                        data = {'type': 'message', 'message': public_message(rows[0])}
+                            elif event['type'] in {'task.created', 'task.started', 'task.finished', 'task.failed'}:
+                                task = store.visitor_task(conversation_id, cutoff, event['task_id'])
+                                if task:
+                                    data = {'type': 'task', 'task': task}
+                            encoded = f'id: {cursor}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n' if data else None
+                        if encoded:
+                            yield encoded
+                    if len(batch) < 100:
+                        # One-second idle revalidation, no raw account event payloads.
+                        yield ': keepalive\n\n'
+                        await asyncio.sleep(0.5)
+                    else:
+                        await asyncio.sleep(0)
+            except (HTTPException, ValueError):
+                return
+            finally:
+                release()
+        async def cleanup():
+            release()
+        return StreamingResponse(stream(), media_type='text/event-stream',
+            headers={'Cache-Control': 'no-store', 'X-Accel-Buffering': 'no'}, background=BackgroundTask(cleanup))
 
     def memory_owner(scope: str) -> str:
         from ..tools.memory import SHARED_AGENT
@@ -873,6 +1384,8 @@ def build_router(config: Config, store: Store, runtime: Runtime) -> APIRouter:
                 if key in merged and value is not None:
                     merged[key] = value
         merged["tools"] = [str(item) for item in (merged.get("tools") or [])][:64]
+        if config.isolation.get("desktop") and merged.get("execution_target") == "container":
+            merged["tools"] = list(dict.fromkeys([*merged["tools"], "desktop", "skill"]))
         return merged
 
     def _validate_new_bot_defaults(merged: dict) -> None:
@@ -974,6 +1487,8 @@ def build_router(config: Config, store: Store, runtime: Runtime) -> APIRouter:
                 {
                     "id": spec.id,
                     "name": spec.name,
+                    "creation_source": spec.creation_source,
+                    "group_invitable": spec.creation_source == "user_created",
                     "title": spec.title,
                     "emoji": spec.emoji,
                     "entry": spec.entry,
@@ -1305,6 +1820,10 @@ def build_router(config: Config, store: Store, runtime: Runtime) -> APIRouter:
         if creating:
             current = {"name": agent_id, "sandbox": "remote", "tools": ["memory", "browser"]}
         merged = {**current, **changes}
+        if creating:
+            merged["creation_source"] = "user_created"
+        if creating and config.isolation.get("desktop") and merged.get("execution_target") == "container":
+            merged["tools"] = list(dict.fromkeys([*merged.get("tools", []), "desktop", "skill"]))
         engine = str(merged.get("engine", "api") or "api")
         if engine not in config_module.ENGINE_IDS:
             raise HTTPException(422, "不支持的引擎")
@@ -1374,6 +1893,10 @@ def build_router(config: Config, store: Store, runtime: Runtime) -> APIRouter:
                 temporary.unlink(missing_ok=True)
         config.agents = config_module.load(reload=True).agents
         runtime.config.agents = config.agents
+        desktop = config.isolation.get("desktop", {})
+        if creating and merged.get("execution_target") == "container" and desktop.get("skill_id"):
+            if desktop['skill_id'] not in runtime.skills.settings().get('grants', {}).get('*', {}):
+                runtime.skills.grant(agent_id, desktop["skill_id"], desktop["skill_revision"])
         return asdict(config.agents.get(agent_id))
 
     @router.post("/agents", status_code=201)
@@ -1394,6 +1917,7 @@ def build_router(config: Config, store: Store, runtime: Runtime) -> APIRouter:
             original = asdict(config.agents.get(agent_id))
         except KeyError:
             raise HTTPException(404, "Bot 不存在") from None
+        original.pop("creation_source", None)
         original.update(id="bot_" + secrets.token_hex(6), name=original["name"][:75] + " 副本", entry=False)
         agent = save_agent(AgentUpdate(**original), original["id"], creating=True)
         conversation = store.create_conversation([agent["id"]], title=agent["name"])
@@ -1689,15 +2213,42 @@ def build_router(config: Config, store: Store, runtime: Runtime) -> APIRouter:
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from None
 
+    @router.post('/conversations/purge')
+    async def purge_conversations(body: ConversationPurge) -> dict:
+        try:
+            result = await asyncio.to_thread(store.purge_conversations, body.conversation_ids)
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from None
+        except OSError:
+            raise HTTPException(409, '无法清理附件，聊天已保留，请检查存储空间或文件权限后重试') from None
+        await runtime._emit('conversation.purged', {'deleted_count': result['deleted_count']})
+        return result
+
     @router.post("/conversations", status_code=201)
     async def create_conversation(body: NewConversation) -> dict:
         try:
-            members = [config.agents.get(member) for member in dict.fromkeys(body.agent_ids)]
+            if len(body.agent_ids) != len(set(body.agent_ids)):
+                raise ValueError("群成员不能重复")
+            members = [config.agents.get(member) for member in body.agent_ids]
+            if len(members) > 1 and any(member.creation_source != 'user_created' for member in members):
+                raise ValueError("只能邀请本账号用户创建的 Bot")
             title = body.title.strip() or "、".join(member.name for member in members)
             conversation = store.create_conversation([member.id for member in members], title=title)
         except (KeyError, ValueError) as exc:
             raise HTTPException(422, str(exc)) from None
         await runtime._emit("conversation.created", {"conversation_id": conversation["id"]}, "", "")
+        return {"conversation": conversation}
+
+    @router.patch("/conversations/{conversation_id}/members")
+    async def update_members(conversation_id: str, body: ConversationMembers) -> dict:
+        try:
+            conversation = await runtime.update_members(conversation_id, body.agent_ids,
+                body.expected_revision, stop_tasks=body.stop_tasks)
+        except KeyError:
+            raise HTTPException(404, "会话或 Bot 不存在") from None
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from None
+        await runtime._emit("conversation.updated", {"conversation_id": conversation_id})
         return {"conversation": conversation}
 
     @router.patch("/conversations/{conversation_id}")
@@ -1718,16 +2269,25 @@ def build_router(config: Config, store: Store, runtime: Runtime) -> APIRouter:
         return {"conversation": conversation}
 
     @router.get("/conversations/{conversation_id}")
-    async def conversation_detail(conversation_id: str) -> dict:
+    async def conversation_detail(conversation_id: str, after_event_id: int | None = None) -> dict:
         conversation = store.get_conversation(conversation_id)
         if conversation is None:
             raise HTTPException(404, "会话不存在")
+        cursor = store.max_event_id()
+        if after_event_id is not None and 0 <= after_event_id <= cursor:
+            changes = store.list_events(after_id=after_event_id, limit=501)
+            if len(changes) <= 500 and all(e['type'] == 'conversation.message' for e in changes):
+                ids = list({e['payload'].get('message_id') for e in changes
+                    if e['payload'].get('conversation_id') == conversation_id and e['payload'].get('message_id')})
+                return {'delta': True, 'conversation': conversation, 'event_cursor': cursor,
+                        'messages': [public_message(m) for m in store.list_conversation_messages(conversation_id, ids)]}
         return {
+            "delta": False, "event_cursor": cursor,
             "conversation": conversation,
-            "messages": store.list_conversation_messages(conversation_id),
+            "messages": [public_message(m) for m in store.list_conversation_messages(conversation_id)],
             "tasks": [public_task(task) for task in store.list_conversation_tasks(conversation_id)],
             "approvals": store.list_conversation_approvals(conversation_id),
-            "summary": store.get_summary(conversation_id),
+            "summary": store.visible_summary(conversation_id),
             "files": store.list_attachments(conversation_id),
         }
 
@@ -1741,6 +2301,8 @@ def build_router(config: Config, store: Store, runtime: Runtime) -> APIRouter:
             if len(set(body.attachment_ids)) != len(body.attachment_ids):
                 raise ValueError("附件不能重复")
             result = await runtime.submit_message(conversation_id, body.content, body.request_id, body.agent_id,
+                                                 **({'mode':body.mode} if body.mode != 'task' else {}),
+                                                 **({'agent_ids':body.agent_ids} if body.agent_ids is not None else {}),
                                                  **({'envelope':body.envelope} if body.envelope is not None else {}),
                                                  **({"attachment_ids": body.attachment_ids} if body.attachment_ids else {}),
                                                  **({'project_snapshot':body.project_snapshot} if body.project_snapshot is not None else {}))
@@ -1841,11 +2403,12 @@ def build_router(config: Config, store: Store, runtime: Runtime) -> APIRouter:
             raise HTTPException(404, "任务不存在")
         return {
             "task": public_task(task),
-            "messages": store.list_messages(task_id),
+            "messages": [public_message(m) for m in store.list_messages(task_id)],
             "children": [public_task(child) for child in store.children_of(task_id)],
             "outcome":{**store.outcome(task_id),"report_hash":__import__("carme.security",fromlist=["digest"]).digest(store.outcome(task_id)["report"])},
             "runs":store._query('SELECT * FROM task_runs WHERE task_id=? ORDER BY started_at',(task_id,)),
-            "operations":store._query('SELECT * FROM task_operations WHERE task_id=? ORDER BY created_at',(task_id,)),
+            "operations":[{**op, 'result': public_message({'role':'tool','content':op.get('result', '')})['content']}
+                for op in store._query('SELECT * FROM task_operations WHERE task_id=? ORDER BY created_at',(task_id,))],
             "checkpoint":store._query_one('SELECT seq,sha256,created_at FROM task_checkpoints WHERE task_id=? ORDER BY seq DESC LIMIT 1',(task_id,)),
         }
 
@@ -1857,6 +2420,10 @@ def build_router(config: Config, store: Store, runtime: Runtime) -> APIRouter:
         return {"ok": True}
 
     # ---------------- 实时事件流 ----------------
+
+    @router.get("/events/cursor")
+    async def event_cursor():
+        return {"after_id": store.max_event_id()}
 
     @router.get("/events")
     async def events(request: Request, task_id: str = "", after_id: int = 0):
@@ -1891,7 +2458,7 @@ def build_router(config: Config, store: Store, runtime: Runtime) -> APIRouter:
                             cursor = event["id"]
                             if task_id and event.get("task_id") not in ("", task_id):
                                 continue
-                            yield f"id: {cursor}\ndata: {json.dumps(event, ensure_ascii=False)}\n\n"
+                            yield f"id: {cursor}\ndata: {json.dumps(public_event(event), ensure_ascii=False)}\n\n"
                         continue
                     try:
                         await asyncio.wait_for(queue.get(), timeout=20.0)
@@ -1931,9 +2498,10 @@ def build_router(config: Config, store: Store, runtime: Runtime) -> APIRouter:
         if row["status"] != "pending":
             raise HTTPException(409, f"这条已经处理过了（当前状态：{row['status']}）")
 
-        ok = store.decide_approval(
-            approval_id, approved=body.approved, note=body.note.strip()
-        )
+        try:
+            ok = store.decide_approval(approval_id, approved=body.approved, note=body.note.strip(), actor_key='owner')
+        except ValueError:
+            raise HTTPException(409, 'approval_no_longer_valid') from None
         if not ok:
             raise HTTPException(409, "状态刚刚变化了，请刷新后重试")
 
@@ -1954,7 +2522,7 @@ def build_router(config: Config, store: Store, runtime: Runtime) -> APIRouter:
     @router.get("/browser/probe")
     async def probe_browser() -> dict:
         """检查本机浏览器，或检查明确选择的远端执行电脑。"""
-        if config.isolation.get('browser'):
+        if config.isolation.get('desktop') or config.isolation.get('browser'):
             return await runtime.browsers.probe()
         try:
             node = config.sandbox.resolve_node() if config.sandbox.default_node_id else None
@@ -1970,12 +2538,21 @@ def build_router(config: Config, store: Store, runtime: Runtime) -> APIRouter:
         return result
 
     # ---------------- 本机桌面画面与人工鼠标控制 ----------------
+    async def linux_desktop(bot_id, operation, arguments=None, *, control_id=''):
+        if not bot_id: raise HTTPException(422, '请先选择一个 Bot 查看它的独立电脑。')
+        try:
+            return await runtime.execution.desktop_request(bot_id, operation, arguments, control_id=control_id)
+        except ValueError as exc: raise HTTPException(404, str(exc)) from None
+        except RuntimeError as exc: raise HTTPException(409, str(exc)) from None
+
     def mac_runner_desktop() -> bool:
         """Runner 已连接且本地授权有效（前端据此显示真实 Mac 屏幕）。"""
         return time.time() - runtime.execution.mac_seen < 5 and runtime.execution.mac_authorized
 
     @router.get("/desktop/status")
-    async def desktop_status() -> dict:
+    async def desktop_status(request: Request, bot_id: str = '') -> dict:
+        if config.isolation.get('desktop'):
+            return await linux_desktop(bot_id, 'status', control_id=request.headers.get('x-carme-desktop-control', ''))
         if mac_runner_desktop():
             execution = runtime.execution
             width, height = execution.mac_frame_size
@@ -2033,7 +2610,12 @@ def build_router(config: Config, store: Store, runtime: Runtime) -> APIRouter:
         except asyncio.TimeoutError:
             raise HTTPException(503, "Runner 没有回应该控制动作；请确认 Runner 仍在运行。") from None
     @router.get("/desktop/screenshot")
-    async def desktop_screenshot(since: str = "") -> Response:
+    async def desktop_screenshot(request: Request, since: str = "", bot_id: str = '') -> Response:
+        if config.isolation.get('desktop'):
+            result = await linux_desktop(bot_id, 'screenshot', control_id=request.headers.get('x-carme-desktop-control', ''))
+            return Response(content=base64.b64decode(result['body'], validate=True), media_type=result['mime'],
+                headers={'Cache-Control':'no-store', 'X-Content-Type-Options':'nosniff', 'X-Screenshot-Mtime':str(result['at']), 'X-Carme-Bot':bot_id, 'X-Carme-Desktop-Target':result.get('desktop_target','linux'),
+                         'X-Carme-Desktop-State':json.dumps(result.get('state', {}), separators=(',', ':'))})
         if mac_runner_desktop():
             return await runner_frame(since)
         if config.isolation.get('browser'):
@@ -2090,7 +2672,11 @@ def build_router(config: Config, store: Store, runtime: Runtime) -> APIRouter:
         )
 
     @router.post("/desktop/control")
-    async def desktop_control(body: DesktopControl) -> dict:
+    async def desktop_control(body: DesktopControl, bot_id: str = '') -> dict:
+        if config.isolation.get('desktop'):
+            try: return await runtime.execution.set_desktop_control(bot_id, body.enabled, body.control_id)
+            except ValueError as exc: raise HTTPException(404, str(exc)) from None
+            except RuntimeError as exc: raise HTTPException(409, str(exc)) from None
         if mac_runner_desktop():
             runtime.execution.mac_control_enabled = bool(body.enabled)
             runtime.execution.mac_control_queue.clear()
@@ -2110,7 +2696,9 @@ def build_router(config: Config, store: Store, runtime: Runtime) -> APIRouter:
             raise HTTPException(503, str(exc)) from None
 
     @router.post("/desktop/mouse")
-    async def desktop_mouse(body: DesktopMouse) -> dict:
+    async def desktop_mouse(body: DesktopMouse, bot_id: str = '') -> dict:
+        if config.isolation.get('desktop'):
+            return await linux_desktop(bot_id, 'mouse', body.model_dump(exclude={'control_id'}), control_id=body.control_id)
         if mac_runner_desktop():
             return await runner_control("mouse", {"action": body.action, "x": body.x, "y": body.y,
                 "dx": body.dx, "dy": body.dy, "button": body.button,
@@ -2139,7 +2727,9 @@ def build_router(config: Config, store: Store, runtime: Runtime) -> APIRouter:
             raise HTTPException(503, str(exc)) from None
 
     @router.post("/desktop/keyboard")
-    async def desktop_keyboard(body: DesktopKeyboard) -> dict:
+    async def desktop_keyboard(body: DesktopKeyboard, bot_id: str = '') -> dict:
+        if config.isolation.get('desktop'):
+            return await linux_desktop(bot_id, 'keyboard', {k:v for k,v in {'keys':body.keys,'text':body.text}.items() if v}, control_id=body.control_id)
         if mac_runner_desktop():
             return await runner_control("keyboard", {"keys": body.keys})
         if config.isolation.get('browser'):

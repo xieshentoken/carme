@@ -18,6 +18,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -38,8 +39,8 @@ CARME_ROOT = Path(__file__).resolve().parent.parent
 BRIDGE_TOOL_PREFIX = "mcp__carme__"
 # 通过任务桥接暴露给 CLI 引擎的 Carme 工具（claude / codex / pi）。
 # 外部 MCP 工具（mcp__ 前缀）由 _bridge_tools 单独放行，因为它们随连接状态变化。
-BRIDGE_TOOL_NAMES = {"remember", "recall", "forget", "read_attachment", "create_artifact", "delegate", "share_attachment",
-                     "verify_artifact", "list_agents", "list_skills", "use_skill", "propose_skill", "read_file", "write_file", "list_files", "shell", "web_search", "fetch_page",
+BRIDGE_TOOL_NAMES = {"bot_computer", "remember", "recall", "forget", "read_attachment", "create_artifact", "delegate", "share_attachment",
+                     "verify_artifact", "list_agents", "list_skills", "use_skill", "install_skill", "remove_skill", "propose_skill", "read_file", "write_file", "list_files", "shell", "web_search", "fetch_page",
                      "web_open", "web_snapshot", "web_click", "web_type", "web_press", "web_scroll",
                      "web_back", "web_screenshot", "web_login", "web_login_wait", "web_close"}
 # 外部 MCP 工具在 Carme 工具表里的前缀（见 mcp.py）。
@@ -57,6 +58,7 @@ class CliRunResult:
     exit_code: int
     stderr: str = ""
     yielded_tool: dict | None = None
+    context_summary: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -131,12 +133,13 @@ class TaskToolBridge:
     """
 
     def __init__(self, tool_specs: list[dict], execute: Callable[[str, dict], Awaitable[Any]],
-                 *, max_calls: int = MAX_BRIDGE_TOOL_CALLS) -> None:
+                 *, max_calls: int = MAX_BRIDGE_TOOL_CALLS, native_ids: bool = False) -> None:
         self.tools = _bridge_tools(tool_specs)
         self._by_name = {tool.name: tool for tool in self.tools}
         self._execute = execute
         self._max_calls = max(1, min(int(max_calls), MAX_BRIDGE_TOOL_CALLS))
         self._calls = 0
+        self._native_ids = native_ids
         self._token = secrets.token_urlsafe(32)
         self._server: asyncio.AbstractServer | None = None
         self._clients: set[asyncio.Task] = set()
@@ -161,9 +164,9 @@ class TaskToolBridge:
         return f"http://127.0.0.1:{port}"
 
     async def close(self) -> None:
+        server = self._server
         if self._server is not None:
             self._server.close()
-            await self._server.wait_closed()
             self._server = None
         current = asyncio.current_task()
         pending = [task for task in self._clients if task is not current and not task.done()]
@@ -171,6 +174,9 @@ class TaskToolBridge:
             task.cancel()
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
+        # Python 3.13 waits for accepted clients too. Cancel callbacks before waiting.
+        if server is not None:
+            await server.wait_closed()
 
     async def _client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         task = asyncio.current_task()
@@ -268,7 +274,10 @@ class TaskToolBridge:
             return
         self._calls += 1
         try:
-            text = await self._execute(name, arguments)
+            call_id = data.get('tool_call_id', '')
+            if self._native_ids and (not isinstance(call_id, str) or not 1 <= len(call_id) <= 200):
+                raise ValueError('pi_tool_call_identity_required')
+            text = await self._execute(name, arguments, call_id) if self._native_ids else await self._execute(name, arguments)
             if isinstance(text, dict):
                 payload = {"ok": True, **text}
                 payload.setdefault("text", "")
@@ -419,7 +428,7 @@ def validate_runtime_profile(profile: dict | None) -> dict:
         raise CliEngineError("runtime_profile_required: 该 Bot 未绑定 Pi 运行档案；请先在「设置 → 模型」页测试 Pi 连接（自动登记），再在 Bot 设置中选择该档案")
     keys = {"id", "engine", "package_name", "package_version", "image_digest", "execution_mode",
             "inherit_user_config", "native_tools", "credential_ref", "credential_kind", "model",
-            "session_authority", "resume_personal_sessions"}
+            "session_authority", "resume_personal_sessions", "context_window", "max_output_tokens"}
     if (not isinstance(profile, dict) or set(profile) - keys or profile.get("engine") != "pi"
             or profile.get("package_name") != PI_PACKAGE or profile.get("package_version") != PI_VERSION
             or profile.get("execution_mode") != "managed_bridge"
@@ -435,6 +444,9 @@ def validate_runtime_profile(profile: dict | None) -> dict:
         raise CliEngineError("explicit_provider_model_required")
     if not isinstance(profile.get("image_digest"), str) or not re.fullmatch(r"sha256:[a-f0-9]{64}", profile["image_digest"]):
         raise CliEngineError("runtime_image_unverified")
+    window, output = profile.get('context_window', 32768), profile.get('max_output_tokens', 8192)
+    if type(window) is not int or type(output) is not int or not 4096 <= window <= 2_000_000 or not 256 <= output < window:
+        raise CliEngineError('runtime_model_limits_invalid')
     return dict(profile)
 
 
@@ -623,6 +635,8 @@ def _event_text(engine: str, event: dict) -> tuple[str, str]:
             return str(nested.get("delta") or ""), ""
         if kind in {"message_end", "message_stop"}:
             message = event.get("message") or {}
+            if message.get('role') not in (None, 'assistant'):
+                return '', ''
             if str(message.get("stopReason") or "") == "error":
                 return "", _safe_line(_redact(str(message.get("errorMessage") or "Pi 返回错误")))
             return _text_from_content(message.get("content")), ""
@@ -783,12 +797,14 @@ async def _run_cli_process(
     on_stream: Callable[[dict], Awaitable[None]] | None = None,
     on_tool_event: Callable[[str, dict], Awaitable[None]] | None = None,
     runtime_models: dict | None = None,
+    native_context: dict | None = None,
+    on_diagnostic: Callable[[dict], Awaitable[None]] | None = None,
 ) -> CliRunResult:
     if os.getenv("CARME_CONTAINER_CONTROL") == "1":
         raise CliEngineError("cli_process_denied_in_control: use the Broker")
     if tool_specs and tool_execute is None:
         raise CliEngineError("CLI 工具桥接缺少 Carme 执行回调")
-    bridge = TaskToolBridge(tool_specs or [], tool_execute, max_calls=max_tool_calls) if tool_specs and tool_execute else None
+    bridge = TaskToolBridge(tool_specs or [], tool_execute, max_calls=max_tool_calls, native_ids=native_context is not None) if tool_specs and tool_execute else None
     temporary = tempfile.TemporaryDirectory(prefix="carme-cli-")
     temp_dir = Path(temporary.name)
     process = None
@@ -831,6 +847,13 @@ async def _run_cli_process(
                           pi_extension_path=pi_extension_path,
                           claude_settings_path=claude_settings_path,
                           max_turns=max_tool_calls)
+        if native_context is not None:
+            # A fixed SDK entrypoint uses native SessionManager/AgentSession. No discovery or host tools.
+            env['CARME_PI_SDK_PATH'] = str(Path(binary).resolve().parent / 'index.js')
+            argv = [shutil.which('node') or '/usr/local/bin/node', str(Path(__file__).with_name('pi_session.mjs'))]
+            prompt = json.dumps({**native_context, 'model': model, 'effort': effort,
+                                 'tools': [{ 'name': t.name, 'description': t.description, 'parameters': t.input_schema }
+                                           for t in (bridge.tools if bridge else [])]}, ensure_ascii=False)
         # No configured workspace means an isolated temporary directory, never the Carme repo.
         cwd = Path(workspace_dir).expanduser().resolve() if workspace_dir else temp_dir
         cwd.mkdir(parents=True, exist_ok=True)
@@ -850,7 +873,7 @@ async def _run_cli_process(
         temporary.cleanup()
         raise
 
-    state = {"text": "", "bytes": 0}
+    state = {"text": "", "bytes": 0, "stream_at": 0.0}
     native_pending: dict[str, tuple[str, bool]] = {}
     native_started = 0
     bridge_names = set(bridge.raw_names()) if bridge is not None else set()
@@ -875,6 +898,19 @@ async def _run_cli_process(
                 # become an assistant answer or reflect a secret to the UI.
                 continue
             else:
+                if native_context is not None and isinstance(event, dict) and event.get('type') == 'carme_message_start':
+                    state['text'] = ''
+                    continue
+                if isinstance(event, dict) and event.get('type') == 'carme_diagnostic':
+                    if on_diagnostic:
+                        await on_diagnostic({k:v for k,v in event.items() if k != 'type'})
+                    continue
+                if native_context is not None and isinstance(event, dict) and event.get('type') == 'carme_context':
+                    summary = event.get('summary')
+                    if summary is None or (isinstance(summary, dict) and isinstance(summary.get('content'), str)
+                            and len(summary['content']) <= 262144 and isinstance(summary.get('updated_at'), (int, float))):
+                        state['context_summary'] = summary
+                    continue
                 native_events = _native_tool_events(engine, event if isinstance(event, dict) else {},
                                                     native_pending, bridge_names)
                 for event_type, tool_name, failed in native_events:
@@ -898,7 +934,8 @@ async def _run_cli_process(
                 state["text"] = delta
             else:
                 state["text"] += delta
-            if on_stream:
+            if on_stream and (time.monotonic() - state['stream_at'] >= .2 or _event_is_snapshot(engine, event)):
+                state['stream_at'] = time.monotonic()
                 await on_stream({"message_id": message_id, "content": state["text"],
                                  "model": model or f"{engine}-cli", "provider": engine, "status": "streaming"})
 
@@ -951,4 +988,5 @@ async def _run_cli_process(
         raise CliEngineError(f"{_definition(engine)['label']} 退出码 {process.returncode}：{detail}")
     if not text:
         raise CliEngineError(f"{_definition(engine)['label']} 返回空输出；请检查登录状态和模型配置")
-    return CliRunResult(engine=engine, text=text, exit_code=process.returncode, stderr=_safe_line(_redact(stderr)))
+    return CliRunResult(engine=engine, text=text, exit_code=process.returncode, stderr=_safe_line(_redact(stderr)),
+                        context_summary=state.get('context_summary'))

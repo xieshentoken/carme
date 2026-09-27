@@ -28,12 +28,15 @@ import json
 import os
 import re
 import shutil
+import stat
 import tarfile
 import time
+import threading
+import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urljoin
 
 import httpx
 import yaml
@@ -79,6 +82,7 @@ class Skill:
     files: list[str] = field(default_factory=list)
     size: int = 0
     error: str = ""
+    shared: bool = False
 
     def public(self) -> dict[str, Any]:
         return {
@@ -93,6 +97,7 @@ class Skill:
             "file_count": len(self.files),
             "size": self.size,
             "error": self.error,
+            "shared": self.shared,
         }
 
     def prompt_line(self) -> str:
@@ -234,10 +239,22 @@ def _list_files(root: Path, *, complete=False) -> tuple[list[str], int]:
     return files, total
 
 
+def _bundle_entries(path: Path) -> list[dict]:
+    files, _ = _list_files(path, complete=True)
+    entries = []
+    for name in sorted(files):
+        raw = (path / name).read_bytes()
+        entries.append({'path': name, 'sha256': hashlib.sha256(raw).hexdigest(), 'size': len(raw)})
+    return entries
+
+
 class SkillManager:
     """扫描、安装、启停技能。所有方法都可从事件循环里直接调用。"""
 
-    def __init__(self, root: Path, settings_path: Path) -> None:
+    def __init__(self, root: Path, settings_path: Path, *, download_check=None, download_safety=None) -> None:
+        self._lock = threading.RLock()
+        self.download_check = download_check or (lambda: None)
+        self.download_safety = download_safety or {}
         self.root = Path(root).resolve()
         self.settings_path = Path(settings_path)
         self._prompt_cache: tuple[tuple, float, str] | None = None
@@ -287,32 +304,34 @@ class SkillManager:
 
     def list_skills(self) -> list[Skill]:
         """扫描所有技能根目录。坏技能也列出来，但要带上 error 说明。"""
-        settings = self.settings()
-        disabled = {str(item) for item in settings.get("disabled") or []}
-        metadata = settings.get("installed") or {}
-        found: dict[str, Skill] = {}
-        for root in self._roots():
-            if not root.is_dir():
-                continue
-            for entry in sorted(root.iterdir()):
-                if not entry.is_dir() or entry.is_symlink():
+        with self._lock:
+            settings = self.settings()
+            disabled = {str(item) for item in settings.get("disabled") or []}
+            metadata = settings.get("installed") or {}
+            found: dict[str, Skill] = {}
+            for root in self._roots():
+                if not root.is_dir():
                     continue
-                skill_id = entry.name
-                if not SKILL_ID_PATTERN.match(skill_id) or skill_id in found:
-                    continue
-                try:
-                    skill = self._load(skill_id, entry)
-                except SkillError as exc:
-                    skill = Skill(id=skill_id, name=skill_id, description="", path=entry, error=str(exc))
-                except OSError as exc:  # 扫描途中目录被删或权限变化：当成坏技能列出来
-                    skill = Skill(id=skill_id, name=skill_id, description="", path=entry,
-                                  error=f"无法读取技能目录：{exc}")
-                record = metadata.get(skill_id) if isinstance(metadata.get(skill_id), dict) else {}
-                skill.source = str(record.get("source") or skill.source or "本地目录")
-                skill.installed_at = _safe_time(record.get("installed_at"))
-                skill.enabled = skill_id not in disabled
-                found[skill_id] = skill
-        return sorted(found.values(), key=lambda item: item.id)
+                for entry in sorted(root.iterdir()):
+                    if not entry.is_dir() or entry.is_symlink():
+                        continue
+                    skill_id = entry.name
+                    if not SKILL_ID_PATTERN.match(skill_id) or skill_id in found or skill_id in settings.get("aliases", {}):
+                        continue
+                    try:
+                        skill = self._load(skill_id, entry)
+                    except SkillError as exc:
+                        skill = Skill(id=skill_id, name=skill_id, description="", path=entry, error=str(exc))
+                    except OSError as exc:  # 扫描途中目录被删或权限变化：当成坏技能列出来
+                        skill = Skill(id=skill_id, name=skill_id, description="", path=entry,
+                                      error=f"无法读取技能目录：{exc}")
+                    record = metadata.get(skill_id) if isinstance(metadata.get(skill_id), dict) else {}
+                    skill.source = str(record.get("source") or skill.source or "本地目录")
+                    skill.installed_at = _safe_time(record.get("installed_at"))
+                    skill.enabled = skill_id not in disabled
+                    skill.shared = skill_id in settings.get("grants", {}).get("*", {})
+                    found[skill_id] = skill
+            return sorted(found.values(), key=lambda item: item.id)
 
     def _load(self, skill_id: str, directory: Path) -> Skill:
         document = directory / SKILL_FILENAME
@@ -343,6 +362,7 @@ class SkillManager:
         wanted = (key or "").strip().lower()
         if not wanted:
             raise SkillError("请提供技能 id 或名称")
+        wanted = self.settings().get("aliases", {}).get(wanted, wanted)
         skills = self.list_skills()
         for skill in skills:
             if skill.id == wanted:
@@ -388,7 +408,7 @@ class SkillManager:
         人工改动也能在几秒内反映出来。
         """
         if bot_id:
-            grants=self.settings().get('grants',{}).get(bot_id,{})
+            grants=self.effective_grants(bot_id)
             lines=[f'- {self.manifest(sid,revision)["name"]}（{sid}），固定版本 {revision}；用 use_skill 分页读取 manifest 和完整说明。'
                    for sid,revision in grants.items() if sid not in self.settings()['disabled']]
             return '## 你可用的技能（Skill）\n'+'\n'.join(lines) if lines else ''
@@ -416,20 +436,19 @@ class SkillManager:
     # ---------------- 写入 ----------------
 
     def snapshot(self, skill_id: str) -> dict:
-        skill=self.get(skill_id)
-        if skill.error:raise SkillError(skill.error)
-        files,_=_list_files(skill.path,complete=True)
-        entries=[{'path':p,'sha256':hashlib.sha256((skill.path/p).read_bytes()).hexdigest(),
-                  'size':(skill.path/p).stat().st_size} for p in sorted(files)]
-        from .security import digest
-        revision=digest(entries);destination=self.root/'.versions'/skill.id/revision
-        if not destination.exists():
-            destination.parent.mkdir(mode=0o700,parents=True,exist_ok=True)
-            temporary=destination.with_name(revision+'.pending')
-            if temporary.exists():shutil.rmtree(temporary)
-            _copy_tree(skill.path,temporary)
-            temporary.rename(destination)
-        return self.manifest(skill.id,revision)
+        with self._lock:
+            skill=self.get(skill_id)
+            if skill.error:raise SkillError(skill.error)
+            entries = _bundle_entries(skill.path)
+            from .security import digest
+            revision=digest(entries);destination=self.root/'.versions'/skill.id/revision
+            if not destination.exists():
+                destination.parent.mkdir(mode=0o700,parents=True,exist_ok=True)
+                temporary=destination.with_name(revision+'.pending')
+                if temporary.exists():shutil.rmtree(temporary)
+                _copy_tree(skill.path,temporary)
+                temporary.rename(destination)
+            return self.manifest(skill.id,revision)
 
     def manifest(self, skill_id: str, revision: str) -> dict:
         from .security import digest
@@ -447,25 +466,83 @@ class SkillManager:
                 'body_chars':len(body),'directory':'/inputs/skills/'+skill_id+'/'+revision}
 
     def grant(self, bot_id: str, skill_id: str, revision: str, *, revoke=False):
-        self.manifest(skill_id,revision)
-        settings=self.settings();approved=settings.setdefault('approved_versions',{}).setdefault(skill_id,[])
-        # Explicit admin grant approves an installed version; learned candidates use publish_candidate.
-        candidates=settings.get('candidates',{})
-        if any(c['skill_id']==skill_id and c['revision']==revision and c['status']!='published' for c in candidates.values()):
-            raise SkillError('candidate_requires_test_and_publication')
-        if revision not in approved:approved.append(revision)
-        grants=settings.setdefault('grants',{}).setdefault(bot_id,{})
-        previous=grants.get(skill_id)
-        if revoke:grants.pop(skill_id,None)
-        else:grants[skill_id]=revision
-        settings.setdefault('grant_history',[]).append({'bot_id':bot_id,'skill_id':skill_id,'previous':previous,
-            'revision':None if revoke else revision,'time':time.time()})
-        self._save(settings)
+        with self._lock:
+            self.manifest(skill_id,revision)
+            settings=self.settings();approved=settings.setdefault('approved_versions',{}).setdefault(skill_id,[])
+            # Explicit admin grant approves an installed version; learned candidates use publish_candidate.
+            candidates=settings.get('candidates',{})
+            if any(c['skill_id']==skill_id and c['revision']==revision and c['status']!='published' for c in candidates.values()):
+                raise SkillError('candidate_requires_test_and_publication')
+            if revision not in approved:approved.append(revision)
+            grants=settings.setdefault('grants',{}).setdefault(bot_id,{})
+            previous=grants.get(skill_id)
+            if revoke:grants.pop(skill_id,None)
+            else:grants[skill_id]=revision
+            if bot_id != '*':
+                disabled = set(settings.setdefault('disabled_by_bot', {}).get(bot_id, []))
+                if revoke: disabled.add(skill_id)
+                else: disabled.discard(skill_id)
+                settings['disabled_by_bot'][bot_id] = sorted(disabled)
+            settings.setdefault('grant_history',[]).append({'bot_id':bot_id,'skill_id':skill_id,'previous':previous,
+                'revision':None if revoke else revision,'time':time.time()})
+            self._save(settings)
+
+    def effective_grants(self, bot_id: str, settings=None) -> dict[str, str]:
+        settings = self.settings() if settings is None else settings
+        grants = {**settings.get('grants', {}).get('*', {}),
+                  **settings.get('grants', {}).get(bot_id, {})}
+        disabled = set(settings['disabled']) | set(settings.get('disabled_by_bot', {}).get(bot_id, []))
+        return {sid: revision for sid, revision in grants.items() if sid not in disabled}
+
+    def share(self, skill_id: str, revision: str) -> None:
+        """A user installation is available to existing and future bots of this account."""
+        with self._lock:
+            skill = self.get(skill_id)
+            if not skill.enabled or skill.error:
+                raise SkillError('skill_disabled_or_invalid')
+            self.grant('*', skill.id, revision)
+
+    def migrate_shared(self) -> dict[str, str]:
+        """Run while the account is stopped; merge only identical, already approved bundles."""
+        with self._lock:
+            settings = self.settings()
+            if settings.get('account_sharing_version') == 1:
+                return {}
+            candidate_ids = {c['skill_id'] for c in settings.get('candidates', {}).values()}
+            seen, aliases = {}, {}
+            for skill in sorted(self.list_skills(), key=lambda s: (s.installed_at, s.id)):
+                if skill.error or not skill.enabled or skill.id in candidate_ids:
+                    continue
+                authorized = {g[skill.id] for g in settings.get('grants', {}).values() if skill.id in g}
+                if not authorized:
+                    continue
+                revision = self.snapshot(skill.id)['revision']
+                if revision not in authorized:
+                    continue  # Never approve an edited, unreviewed working copy during migration.
+                canonical = seen.setdefault(revision, skill.id)
+                settings.setdefault('grants', {}).setdefault('*', {})[canonical] = revision
+                approved = settings.setdefault('approved_versions', {}).setdefault(canonical, [])
+                if revision not in approved: approved.append(revision)
+                for bot, grants in settings['grants'].items():
+                    if bot != '*' and grants.get(skill.id) == revision:
+                        grants.pop(skill.id)
+                if canonical != skill.id and authorized == {revision} and skill.path.parent == self.root:
+                    aliases[skill.id] = canonical
+            settings.setdefault('aliases', {}).update(aliases)
+            for alias in aliases:
+                settings['installed'].pop(alias, None)
+                settings['grants']['*'].pop(alias, None)
+            settings['account_sharing_version'] = 1
+            self._save(settings)
+            # Old immutable .versions and task receipts stay intact. Aliases keep old chat IDs usable.
+            for alias in aliases:
+                shutil.rmtree(self.root / alias)
+            return aliases
 
     def authorized_revision(self, bot_id, skill_id, *, task=None):
         settings=self.settings()
         if skill_id in settings['disabled']:raise SkillError('技能已停用：skill_disabled')
-        revision=settings.get('grants',{}).get(bot_id,{}).get(skill_id)
+        revision=self.effective_grants(bot_id, settings).get(skill_id)
         test=(json.loads(task['meta']).get('skill_test',{}) if task else {})
         if test.get('skill_id')==skill_id and task['agent_id']==bot_id:revision=test['revision']
         if not revision:raise SkillError('skill_version_not_granted')
@@ -493,67 +570,69 @@ class SkillManager:
                 'manifest_cursor':'','manifest_file':'@manifest','file_count':len(manifest['files'])}
 
     def candidate(self, store, source_task_id, *, name, document, private_literals, files=None):
-        from .security import digest
-        source=store.get_task(source_task_id);outcome=store.outcome(source_task_id)
-        if not source or source['status']!='done' or outcome['status']!='verified' or not outcome['user_accepted']:
-            raise SkillError('accepted_verified_trace_required')
-        if not store.memory_refs_valid(json.loads(source['meta']).get('memory_refs',[])):
-            raise SkillError('source_memory_changed')
-        if not isinstance(private_literals,list) or any(not isinstance(v,str) or not v for v in private_literals):raise SkillError('privacy_literals_required')
-        if not isinstance(name,str) or not isinstance(document,str):raise SkillError('candidate_text_required')
-        files=files or {}
-        if not isinstance(files,dict) or len(files)>50 or len(json.dumps(files).encode())>512000:raise SkillError('candidate_bundle_limit')
-        for rel,text in files.items():
-            if not isinstance(rel,str) or not isinstance(text,str) or _safe_relative(rel)=='SKILL.md':raise SkillError('candidate_file_denied')
-            if any(value in rel for value in private_literals):raise SkillError('candidate_private_filename_denied')
-        for value in sorted(private_literals,key=len,reverse=True):name=name.replace(value,'redacted')
-        cleaned=document
-        for value in sorted(private_literals,key=len,reverse=True):cleaned=cleaned.replace(value,'[已脱敏]')
-        cleaned=re.sub(r'(?i)(?:sk-[a-z0-9_-]{8,}|bearer\s+[a-z0-9._-]{8,}|(?:api[_-]?key|password|token)\s*[:=]\s*[^\s]+)', '[凭据已移除]',cleaned)
-        cleaned=re.sub(r'/Users/[^\s"\']+', '[个人路径已移除]',cleaned)
-        skill=self.install_from_text(cleaned,name=name,source='verified-task:'+source_task_id)
-        files=files or {}
-        if not isinstance(files,dict) or len(files)>50 or len(json.dumps(files).encode())>512000:raise SkillError('candidate_bundle_limit')
-        for rel,text in files.items():
-            rel=_safe_relative(rel)
-            if rel=='SKILL.md' or not isinstance(text,str):raise SkillError('candidate_file_denied')
-            for value in sorted(private_literals,key=len,reverse=True):text=text.replace(value,'[已脱敏]')
-            text=re.sub(r'(?i)(?:sk-[a-z0-9_-]{8,}|bearer\s+[a-z0-9._-]{8,}|(?:api[_-]?key|password|token)\s*[:=]\s*[^\s]+)', '[凭据已移除]',text)
-            text=re.sub(r'/Users/[^\s"\']+', '[个人路径已移除]',text)
-            path=skill.path/rel;path.parent.mkdir(parents=True,exist_ok=True);path.write_text(text)
-        manifest=self.snapshot(skill.id);cid='candidate_'+digest({'source':source_task_id,'revision':manifest['revision']})[:24]
-        candidate={'id':cid,'skill_id':skill.id,'revision':manifest['revision'],'source_task_id':source_task_id,
-            'source_report_hash':digest(outcome['report']),'source_inputs':json.loads(source['meta'])['envelope']['input_artifacts'],
-            'status':'candidate','test_task_id':None,'privacy_review_required':True,'created_at':time.time()}
-        settings=self.settings();settings.setdefault('candidates',{})[cid]=candidate;self._save(settings)
-        return candidate
+        with self._lock:
+            from .security import digest
+            source=store.get_task(source_task_id);outcome=store.outcome(source_task_id)
+            if not source or source['status']!='done' or outcome['status']!='verified' or not outcome['user_accepted']:
+                raise SkillError('accepted_verified_trace_required')
+            if not store.memory_refs_valid(json.loads(source['meta']).get('memory_refs',[])):
+                raise SkillError('source_memory_changed')
+            if not isinstance(private_literals,list) or any(not isinstance(v,str) or not v for v in private_literals):raise SkillError('privacy_literals_required')
+            if not isinstance(name,str) or not isinstance(document,str):raise SkillError('candidate_text_required')
+            files=files or {}
+            if not isinstance(files,dict) or len(files)>50 or len(json.dumps(files).encode())>512000:raise SkillError('candidate_bundle_limit')
+            for rel,text in files.items():
+                if not isinstance(rel,str) or not isinstance(text,str) or _safe_relative(rel)=='SKILL.md':raise SkillError('candidate_file_denied')
+                if any(value in rel for value in private_literals):raise SkillError('candidate_private_filename_denied')
+            for value in sorted(private_literals,key=len,reverse=True):name=name.replace(value,'redacted')
+            cleaned=document
+            for value in sorted(private_literals,key=len,reverse=True):cleaned=cleaned.replace(value,'[已脱敏]')
+            cleaned=re.sub(r'(?i)(?:sk-[a-z0-9_-]{8,}|bearer\s+[a-z0-9._-]{8,}|(?:api[_-]?key|password|token)\s*[:=]\s*[^\s]+)', '[凭据已移除]',cleaned)
+            cleaned=re.sub(r'/Users/[^\s"\']+', '[个人路径已移除]',cleaned)
+            skill=self.install_from_text(cleaned,name=name,source='verified-task:'+source_task_id)
+            files=files or {}
+            if not isinstance(files,dict) or len(files)>50 or len(json.dumps(files).encode())>512000:raise SkillError('candidate_bundle_limit')
+            for rel,text in files.items():
+                rel=_safe_relative(rel)
+                if rel=='SKILL.md' or not isinstance(text,str):raise SkillError('candidate_file_denied')
+                for value in sorted(private_literals,key=len,reverse=True):text=text.replace(value,'[已脱敏]')
+                text=re.sub(r'(?i)(?:sk-[a-z0-9_-]{8,}|bearer\s+[a-z0-9._-]{8,}|(?:api[_-]?key|password|token)\s*[:=]\s*[^\s]+)', '[凭据已移除]',text)
+                text=re.sub(r'/Users/[^\s"\']+', '[个人路径已移除]',text)
+                path=skill.path/rel;path.parent.mkdir(parents=True,exist_ok=True);path.write_text(text)
+            manifest=self.snapshot(skill.id);cid='candidate_'+digest({'source':source_task_id,'revision':manifest['revision']})[:24]
+            candidate={'id':cid,'skill_id':skill.id,'revision':manifest['revision'],'source_task_id':source_task_id,
+                'source_report_hash':digest(outcome['report']),'source_inputs':json.loads(source['meta'])['envelope']['input_artifacts'],
+                'status':'candidate','test_task_id':None,'privacy_review_required':True,'created_at':time.time()}
+            settings=self.settings();settings.setdefault('candidates',{})[cid]=candidate;self._save(settings)
+            return candidate
 
     def publish_candidate(self, store, candidate_id, *, test_task_id, bot_ids, revision, privacy_reviewed):
-        from .security import digest
-        settings=self.settings();candidate=settings.get('candidates',{}).get(candidate_id)
-        if not candidate or candidate['revision']!=revision or privacy_reviewed is not True or not bot_ids:
-            raise SkillError('explicit_publication_review_required')
-        source=store.outcome(candidate['source_task_id']);task=store.get_task(test_task_id);outcome=store.outcome(test_task_id)
-        if source['status']!='verified' or not source['user_accepted'] or digest(source['report'])!=candidate['source_report_hash']:
-            raise SkillError('source_acceptance_changed')
-        meta=json.loads(task['meta']) if task else {};test=meta.get('skill_test',{})
-        if (not task or task['status']!='done' or outcome['status']!='verified' or not outcome['user_accepted']
-                or test.get('candidate_id')!=candidate_id or test.get('revision')!=revision
-                or revision not in meta.get('skills_used',{}).values()):raise SkillError('actual_verified_candidate_test_required')
-        old={i['sha256'] for i in candidate['source_inputs']};new={i['sha256'] for i in meta['envelope']['input_artifacts']}
-        if not new or not new-old:raise SkillError('new_input_required')
-        refs=json.loads(store.get_task(candidate['source_task_id'])['meta']).get('memory_refs',[])
-        if not store.memory_refs_valid(refs):raise SkillError('source_memory_revoked')
-        from .attachments import file_path
-        for report in (source['report'],outcome['report']):
-            for artifact in report.get('artifacts',[]):
-                if hashlib.sha256(file_path(store,artifact['id']).read_bytes()).hexdigest()!=artifact['sha256']:
-                    raise SkillError('accepted_artifact_version_changed')
-        candidate.update(status='published',test_task_id=test_task_id,privacy_review_required=False)
-        settings.setdefault('approved_versions',{}).setdefault(candidate['skill_id'],[]).append(revision)
-        self._save(settings)
-        for bot in bot_ids:self.grant(bot,candidate['skill_id'],revision)
-        return candidate
+        with self._lock:
+            from .security import digest
+            settings=self.settings();candidate=settings.get('candidates',{}).get(candidate_id)
+            if not candidate or candidate['revision']!=revision or privacy_reviewed is not True or not bot_ids:
+                raise SkillError('explicit_publication_review_required')
+            source=store.outcome(candidate['source_task_id']);task=store.get_task(test_task_id);outcome=store.outcome(test_task_id)
+            if source['status']!='verified' or not source['user_accepted'] or digest(source['report'])!=candidate['source_report_hash']:
+                raise SkillError('source_acceptance_changed')
+            meta=json.loads(task['meta']) if task else {};test=meta.get('skill_test',{})
+            if (not task or task['status']!='done' or outcome['status']!='verified' or not outcome['user_accepted']
+                    or test.get('candidate_id')!=candidate_id or test.get('revision')!=revision
+                    or revision not in meta.get('skills_used',{}).values()):raise SkillError('actual_verified_candidate_test_required')
+            old={i['sha256'] for i in candidate['source_inputs']};new={i['sha256'] for i in meta['envelope']['input_artifacts']}
+            if not new or not new-old:raise SkillError('new_input_required')
+            refs=json.loads(store.get_task(candidate['source_task_id'])['meta']).get('memory_refs',[])
+            if not store.memory_refs_valid(refs):raise SkillError('source_memory_revoked')
+            from .attachments import file_path
+            for report in (source['report'],outcome['report']):
+                for artifact in report.get('artifacts',[]):
+                    if hashlib.sha256(file_path(store,artifact['id']).read_bytes()).hexdigest()!=artifact['sha256']:
+                        raise SkillError('accepted_artifact_version_changed')
+            candidate.update(status='published',test_task_id=test_task_id,privacy_review_required=False)
+            settings.setdefault('approved_versions',{}).setdefault(candidate['skill_id'],[]).append(revision)
+            self._save(settings)
+            for bot in bot_ids:self.grant(bot,candidate['skill_id'],revision)
+            return candidate
 
     def install_from_text(self, body: str, *, name: str = "", description: str = "", source: str = "界面粘贴") -> Skill:
         if not (body or "").strip():
@@ -566,45 +645,46 @@ class SkillManager:
 
     def install_from_path(self, value: str, *, name: str = "", source: str = "本机目录") -> Skill:
         """从本机目录或单个 .md 文件安装。"""
-        origin = Path((value or "").strip()).expanduser()
-        if not origin.exists():
-            raise SkillError(f"路径不存在：{origin}")
-        if origin.is_symlink():
-            raise SkillError("不接受符号链接，请给出真实路径")
-        if origin.is_dir():
-            document = origin / SKILL_FILENAME
-            if not document.is_file():
-                raise SkillError(f"目录里没有 {SKILL_FILENAME}，这不是一个技能目录")
-            for root in self._roots():
+        with self._lock:
+            origin = Path((value or "").strip()).expanduser()
+            if not origin.exists():
+                raise SkillError(f"路径不存在：{origin}")
+            if origin.is_symlink():
+                raise SkillError("不接受符号链接，请给出真实路径")
+            if origin.is_dir():
+                document = origin / SKILL_FILENAME
+                if not document.is_file():
+                    raise SkillError(f"目录里没有 {SKILL_FILENAME}，这不是一个技能目录")
+                for root in self._roots():
+                    try:
+                        if root.is_dir() and origin.parent.resolve() == root.resolve():
+                            raise SkillError("这个目录已经在技能目录里，请直接用现有技能")
+                    except OSError:  # pragma: no cover - 解析失败时让后面的复制去报错
+                        continue
+                text = _read_text(document)
+                meta, _ = _split_frontmatter(text)
+                resolved_name = (name or str(meta.get("name") or "")).strip() or origin.name
+                skill = self._create(resolved_name, source=f"{source}：{origin}")
+                shutil.rmtree(skill.path, ignore_errors=True)
                 try:
-                    if root.is_dir() and origin.parent.resolve() == root.resolve():
-                        raise SkillError("这个目录已经在技能目录里，请直接用现有技能")
-                except OSError:  # pragma: no cover - 解析失败时让后面的复制去报错
-                    continue
-            text = _read_text(document)
-            meta, _ = _split_frontmatter(text)
-            resolved_name = (name or str(meta.get("name") or "")).strip() or origin.name
-            skill = self._create(resolved_name, source=f"{source}：{origin}")
-            shutil.rmtree(skill.path, ignore_errors=True)
-            try:
-                files, size = _copy_tree(origin, skill.path)
-            except BaseException:
-                shutil.rmtree(skill.path, ignore_errors=True)
-                raise
-            if not (skill.path / SKILL_FILENAME).is_file():
-                shutil.rmtree(skill.path, ignore_errors=True)
-                raise SkillError(f"复制后缺少 {SKILL_FILENAME}")
-            return self._record(skill.id, resolved_name, files, size, source=f"{source}：{origin}")
-        if origin.suffix.lower() not in {".md", ".markdown", ".txt"}:
-            raise SkillError("只支持技能目录或 .md 文件")
-        if origin.stat().st_size > MAX_BODY_BYTES:
-            raise SkillError("技能文件超过 512 KB")
-        text = _read_text(origin)
-        meta, body = _split_frontmatter(text)
-        resolved_name = (name or str(meta.get("name") or "")).strip() or origin.stem
-        description = str(meta.get("description") or "").strip() or _describe(body)
-        document = self._compose(resolved_name, description, body, meta)
-        return self._write_skill(document, resolved_name, source=f"{source}：{origin}")
+                    files, size = _copy_tree(origin, skill.path)
+                except BaseException:
+                    shutil.rmtree(skill.path, ignore_errors=True)
+                    raise
+                if not (skill.path / SKILL_FILENAME).is_file():
+                    shutil.rmtree(skill.path, ignore_errors=True)
+                    raise SkillError(f"复制后缺少 {SKILL_FILENAME}")
+                return self._record(skill.id, resolved_name, files, size, source=f"{source}：{origin}")
+            if origin.suffix.lower() not in {".md", ".markdown", ".txt"}:
+                raise SkillError("只支持技能目录或 .md 文件")
+            if origin.stat().st_size > MAX_BODY_BYTES:
+                raise SkillError("技能文件超过 512 KB")
+            text = _read_text(origin)
+            meta, body = _split_frontmatter(text)
+            resolved_name = (name or str(meta.get("name") or "")).strip() or origin.stem
+            description = str(meta.get("description") or "").strip() or _describe(body)
+            document = self._compose(resolved_name, description, body, meta)
+            return self._write_skill(document, resolved_name, source=f"{source}：{origin}")
 
     async def install_from_url(self, value: str, *, name: str = "", source: str = "URL") -> Skill:
         url = _http_url(value)
@@ -630,42 +710,85 @@ class SkillManager:
             hint = f"子目录 {wanted}" if wanted else "仓库根目录"
             raise SkillError(f"在 {hint} 里没有找到 {SKILL_FILENAME}，请确认路径")
         document, files = extracted
-        meta, body = _split_frontmatter(document)
-        resolved_name = (name or str(meta.get("name") or "")).strip() or wanted.split("/")[-1] or repo
-        description = str(meta.get("description") or "").strip() or _describe(body)
-        composed = self._compose(resolved_name, description, body, meta)
-        _check_document_size(composed)
         source_text = f"GitHub：{owner}/{repo}" + (f"/{wanted}" if wanted else "") + f"@{branch}"
-        skill = self._create(resolved_name, source=source_text)
-        shutil.rmtree(skill.path, ignore_errors=True)
-        skill.path.mkdir(parents=True, exist_ok=True)
-        (skill.path / SKILL_FILENAME).write_text(composed, encoding="utf-8")
-        kept = {SKILL_FILENAME}
-        total = len(composed.encode("utf-8"))
-        for relative, content in files:
-            if relative in kept:
-                continue
-            if len(kept) >= MAX_SKILL_FILES:
-                break
-            if total + len(content) > MAX_SKILL_BYTES:
-                break
-            destination = skill.path / relative
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            destination.write_bytes(content)
-            kept.add(relative)
-            total += len(content)
-        return self._record(skill.id, resolved_name, sorted(kept), total, source=source_text)
+        return self._install_bundle(document, files, name=name, fallback_name=wanted.split('/')[-1] or repo, source=source_text)
+
+    def install_from_zip(self, raw: bytes, *, subpath: str = "", name: str = "", source: str = "ZIP 技能包") -> Skill:
+        """Read bounded regular files only; never extract paths or run package scripts."""
+        if not 0 < len(raw) <= MAX_ARCHIVE_BYTES:
+            raise SkillError('skill_archive_size_denied')
+        wanted = _safe_relative(subpath)
+        try:
+            with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+                entries = archive.infolist()
+                if len(entries) > MAX_ARCHIVE_MEMBERS:
+                    raise SkillError('skill_archive_member_limit')
+                files = {}; total = 0; seen = set()
+                for entry in entries:
+                    path = entry.filename
+                    if (not path or path.startswith('/') or '\\' in path or ':' in path
+                            or any(ord(c) < 32 for c in path) or '..' in path.split('/')
+                            or _safe_relative(path.rstrip('/')) != path.rstrip('/')
+                            or path.casefold() in seen or entry.flag_bits & 1
+                            or stat.S_IFMT(entry.external_attr >> 16) not in (0, stat.S_IFREG, stat.S_IFDIR)):
+                        raise SkillError('unsafe_skill_archive_member')
+                    seen.add(path.casefold())
+                    total += entry.file_size
+                    if (entry.file_size > MAX_SKILL_BYTES or total > MAX_SKILL_BYTES
+                            or entry.file_size > 200 * max(1, entry.compress_size)):
+                        raise SkillError('skill_archive_expansion_limit')
+                    if not entry.is_dir():
+                        files[path] = entry
+                documents = [p for p in files if p == (wanted + '/' if wanted else '') + SKILL_FILENAME]
+                if not wanted and not documents:
+                    documents = [p for p in files if p.endswith('/' + SKILL_FILENAME)]
+                if len(documents) != 1:
+                    raise SkillError('请用 subpath 指定唯一包含 SKILL.md 的目录')
+                document = documents[0]; base = document[:-len(SKILL_FILENAME)]
+                selected = [(p[len(base):], entry) for p, entry in files.items() if p.startswith(base)
+                            and not any(part in _SKIP_DIRS for part in p[len(base):].split('/'))]
+                if len(selected) > MAX_SKILL_FILES or files[document].file_size > MAX_BODY_BYTES:
+                    raise SkillError('skill_bundle_limit')
+                contents = [(p, archive.read(entry)) for p, entry in selected if p != SKILL_FILENAME]
+                return self._install_bundle(archive.read(files[document]).decode('utf-8-sig'), contents, name=name, source=source)
+        except (zipfile.BadZipFile, UnicodeError, RuntimeError) as exc:
+            if isinstance(exc, SkillError):
+                raise
+            raise SkillError('无法读取 ZIP 技能包') from exc
+
+    def _install_bundle(self, document, files, *, name='', fallback_name='未命名技能', source='') -> Skill:
+        with self._lock:
+            meta, body = _split_frontmatter(document)
+            resolved_name = (name or str(meta.get("name") or "")).strip() or fallback_name
+            description = str(meta.get("description") or "").strip() or _describe(body)
+            composed = self._compose(resolved_name, description, body, meta)
+            _check_document_size(composed)
+            skill = self._create(resolved_name, source=source)
+            shutil.rmtree(skill.path, ignore_errors=True)
+            skill.path.mkdir(parents=True, exist_ok=True)
+            (skill.path / SKILL_FILENAME).write_text(composed, encoding="utf-8")
+            kept = {SKILL_FILENAME}
+            total = len(composed.encode("utf-8"))
+            for relative, content in files:
+                if relative in kept:
+                    continue
+                if len(kept) >= MAX_SKILL_FILES or total + len(content) > MAX_SKILL_BYTES:
+                    shutil.rmtree(skill.path)
+                    raise SkillError('skill_bundle_limit')
+                destination = skill.path / _safe_relative(relative)
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes(content)
+                kept.add(relative)
+                total += len(content)
+            return self._record(skill.id, resolved_name, sorted(kept), total, source=source)
 
     async def _default_branch(self, owner: str, repo: str) -> str:
         try:
-            async with httpx.AsyncClient(timeout=20.0, follow_redirects=True,
-                                         headers={"User-Agent": _USER_AGENT}) as client:
-                response = await client.get(f"https://api.github.com/repos/{owner}/{repo}")
-            if response.status_code == 200:
-                branch = str((response.json() or {}).get("default_branch") or "").strip()
-                if branch and "/" not in branch:
-                    return branch
-        except (httpx.HTTPError, ValueError, json.JSONDecodeError):
+            raw = await self._download_bytes(f"https://api.github.com/repos/{owner}/{repo}", MAX_MARKDOWN_BYTES)
+            branch = str((json.loads(raw) or {}).get("default_branch") or "").strip()
+            if branch:
+                return branch
+        except (SkillError, ValueError):
             pass
         return "main"
 
@@ -677,60 +800,68 @@ class SkillManager:
             raise SkillError("下载到的技能不是 UTF-8 文本") from exc
 
     async def _download_bytes(self, url: str, limit: int) -> bytes:
+        from .docker_browser import fetch_public
         try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(45.0, connect=15.0),
-                                         follow_redirects=True,
-                                         headers={"User-Agent": _USER_AGENT}) as client:
-                async with client.stream("GET", url) as response:
-                    if response.status_code != 200:
-                        raise SkillError(f"下载失败：HTTP {response.status_code}")
-                    chunks: list[bytes] = []
-                    total = 0
-                    async for chunk in response.aiter_bytes():
-                        total += len(chunk)
-                        if total > limit:
-                            raise SkillError("下载内容超过体积上限")
-                        chunks.append(chunk)
-                    return b"".join(chunks)
+            async with asyncio.timeout(60):
+                for _ in range(6):
+                    output = bytearray()
+                    response = await fetch_public({'url': _http_url(url), 'method': 'GET',
+                        'headers': {'User-Agent': _USER_AGENT}, 'body': ''},
+                        self.download_safety, self.download_check, sink=output.extend, max_bytes=limit)
+                    if response['status'] in {301, 302, 303, 307, 308}:
+                        location = next((v for k, v in response['headers'] if k.lower() == 'location'), '')
+                        if not location:
+                            raise SkillError('下载重定向缺少地址')
+                        url = urljoin(url, location)
+                        continue
+                    if response['status'] != 200:
+                        raise SkillError(f"下载失败：HTTP {response['status']}")
+                    return bytes(output)
+                raise SkillError('下载重定向次数过多')
         except SkillError:
             raise
-        except httpx.HTTPError as exc:
+        except (httpx.HTTPError, ValueError, TimeoutError) as exc:
             raise SkillError(f"下载失败：{type(exc).__name__}") from exc
 
     def remove(self, skill_id: str) -> None:
-        skill = self.get(skill_id)
-        # 只允许删「本机安装目录」里的技能：额外技能根目录是给人自己管的，
-        # Carme 只读不写，免得误删一份别人维护的共享技能。
-        try:
-            owned = skill.path.parent.resolve() == self.root.resolve()
-        except OSError:  # pragma: no cover - 解析失败按只读处理
-            owned = False
-        if not owned:
-            raise SkillError("这个技能来自只读技能目录，请在对应目录里删除")
-        shutil.rmtree(skill.path, ignore_errors=True)
-        if skill.path.exists():
-            raise SkillError(f"无法删除 {skill.path}，请检查文件权限或占用后重试")
-        settings = self.settings()
-        settings["disabled"] = [item for item in settings["disabled"] if item != skill.id]
-        installed = settings.get("installed") or {}
-        installed.pop(skill.id, None)
-        for grants in settings.get('grants',{}).values():grants.pop(skill.id,None)
-        self._save(settings)
+        with self._lock:
+            skill = self.get(skill_id)
+            # 只允许删「本机安装目录」里的技能：额外技能根目录是给人自己管的，
+            # Carme 只读不写，免得误删一份别人维护的共享技能。
+            try:
+                owned = skill.path.parent.resolve() == self.root.resolve()
+            except OSError:  # pragma: no cover - 解析失败按只读处理
+                owned = False
+            if not owned:
+                raise SkillError("这个技能来自只读技能目录，请在对应目录里删除")
+            shutil.rmtree(skill.path, ignore_errors=True)
+            if skill.path.exists():
+                raise SkillError(f"无法删除 {skill.path}，请检查文件权限或占用后重试")
+            settings = self.settings()
+            settings["disabled"] = [item for item in settings["disabled"] if item != skill.id]
+            installed = settings.get("installed") or {}
+            installed.pop(skill.id, None)
+            for grants in settings.get('grants',{}).values():grants.pop(skill.id,None)
+            for bot, disabled in settings.get('disabled_by_bot', {}).items():
+                settings['disabled_by_bot'][bot] = [sid for sid in disabled if sid != skill.id]
+            settings['aliases'] = {k: v for k, v in settings.get('aliases', {}).items() if v != skill.id}
+            self._save(settings)
 
     def set_enabled(self, skill_id: str, enabled: bool) -> Skill:
-        skill = self.get(skill_id)
-        settings = self.settings()
-        disabled = {str(item) for item in settings.get("disabled") or []}
-        if enabled:
-            disabled.discard(skill.id)
-        else:
-            disabled.add(skill.id)
-        settings["disabled"] = sorted(disabled)
-        self._save(settings)
-        skill.enabled = enabled
-        return skill
+        with self._lock:
+            skill = self.get(skill_id)
+            settings = self.settings()
+            disabled = {str(item) for item in settings.get("disabled") or []}
+            if enabled:
+                disabled.discard(skill.id)
+            else:
+                disabled.add(skill.id)
+            settings["disabled"] = sorted(disabled)
+            self._save(settings)
+            skill.enabled = enabled
+            return skill
 
-    # ---------------- 安装落盘 ----------------
+        # ---------------- 安装落盘 ----------------
 
     def _compose(self, name: str, description: str, body: str, meta: dict[str, Any]) -> str:
         front: dict[str, Any] = {"name": name}
@@ -762,15 +893,28 @@ class SkillManager:
         return Skill(id=candidate, name=name[:120], description="", path=path, source=source)
 
     def _write_skill(self, document: str, name: str, *, source: str) -> Skill:
-        _check_document_size(document)
-        skill = self._create(name, source=source)
-        target = skill.path / SKILL_FILENAME
-        target.write_text(document, encoding="utf-8")
-        return self._record(skill.id, name, [SKILL_FILENAME], len(document.encode("utf-8")), source=source)
+        with self._lock:
+            _check_document_size(document)
+            skill = self._create(name, source=source)
+            target = skill.path / SKILL_FILENAME
+            target.write_text(document, encoding="utf-8")
+            return self._record(skill.id, name, [SKILL_FILENAME], len(document.encode("utf-8")), source=source)
 
     def _record(self, skill_id: str, name: str, files: Iterable[str], size: int, *, source: str) -> Skill:
         settings = self.settings()
         installed = settings.setdefault("installed", {})
+        if not source.startswith('verified-task:'):
+            entries = _bundle_entries(self.root / skill_id)
+            candidates = {c['skill_id'] for c in settings.get('candidates', {}).values()}
+            for existing in installed:
+                path = self.root / existing
+                if existing == skill_id or existing in candidates or not path.is_dir():
+                    continue
+                try: existing_entries = _bundle_entries(path)
+                except (SkillError, OSError): continue
+                if existing_entries == entries:
+                    shutil.rmtree(self.root / skill_id)
+                    return self.get(existing)
         installed[skill_id] = {"source": source, "installed_at": time.time(), "name": name[:120]}
         self._save(settings)
         skill = self.get(skill_id)
@@ -830,12 +974,14 @@ def _extract_skill(archive: bytes, subpath: str) -> tuple[str, list[tuple[str, b
         candidates: list[tuple[str, tarfile.TarInfo]] = []
         members: list[tarfile.TarInfo] = []
         seen_members = 0
-        for member in handle.getmembers():
+        expanded_bytes = 0
+        for member in handle:
             seen_members += 1
+            expanded_bytes += member.size
             if seen_members > MAX_ARCHIVE_MEMBERS:
                 raise SkillError(f"仓库里的文件超过 {MAX_ARCHIVE_MEMBERS} 个，请用子目录指定技能位置")
-            if member.size > MAX_SKILL_BYTES:
-                continue
+            if member.size > MAX_ARCHIVE_BYTES or expanded_bytes > MAX_ARCHIVE_BYTES * 4:
+                raise SkillError('skill_archive_expansion_limit')
             name = member.name.replace("\\", "/").lstrip("./")
             if not name or name.startswith("/") or ".." in name.split("/"):
                 continue
@@ -871,7 +1017,7 @@ def _extract_skill(archive: bytes, subpath: str) -> tuple[str, list[tuple[str, b
             raise SkillError("仓库里的 SKILL.md 不是 UTF-8 文本") from exc
         base = document_member.name.replace("\\", "/").lstrip("./").rsplit("/", 1)[0]
         others: list[tuple[str, bytes]] = []
-        total = 0
+        total = len(document)
         for member in members:
             name = member.name.replace("\\", "/").lstrip("./")
             if not member.isfile() or not name.startswith(base + "/"):
@@ -883,15 +1029,15 @@ def _extract_skill(archive: bytes, subpath: str) -> tuple[str, list[tuple[str, b
             if relative.split("/")[0] in _SKIP_DIRS:
                 continue
             if member.size > MAX_SKILL_BYTES or total + member.size > MAX_SKILL_BYTES:
-                break
+                raise SkillError('skill_bundle_limit')
             stream = handle.extractfile(member)
             if stream is None:
                 continue
             content = stream.read(MAX_SKILL_BYTES + 1)
             if len(content) > MAX_SKILL_BYTES:
-                continue
+                raise SkillError('skill_bundle_limit')
             others.append((relative, content))
             total += len(content)
             if len(others) >= MAX_SKILL_FILES:
-                break
+                raise SkillError('skill_bundle_limit')
         return text, others

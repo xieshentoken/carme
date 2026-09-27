@@ -278,6 +278,149 @@ class M2(m1.M1):
         self.assertNotIn("web_search", policy["tools"])
         self.assertEqual(policy["network"], "none")
 
+    async def test_model_frames_are_signed_and_rpc_sequence_cannot_replay(self):
+        task,job=await self.job()
+        async def synthetic_model(job,data):
+            yield {'type':'accepted'}
+            yield {'type':'end'}
+        message={'sequence':1,'event_id':'stream-id','kind':'model','payload':{'body':{'model':'model'}}}
+        with patch.object(self.runtime.execution,'model',synthetic_model):
+            response=await self.worker(job,message)
+        self.assertEqual(response.headers['X-Carme-Stream'],'1')
+        for index,line in enumerate(response.text.splitlines(),1):
+            frame=json.loads(line)
+            self.assertEqual(frame['sequence'],index)
+            self.assertEqual(frame['signature'],signature(job['token'].encode(),'stream-id:1:'+str(index),encoded(frame['data'])))
+            self.assertNotEqual(frame['signature'],signature(job['token'].encode(),'stream-id:2:'+str(index),encoded(frame['data'])))
+        self.assertEqual((await self.worker(job,message)).status_code,403)
+        task.cancel();await asyncio.gather(task,return_exceptions=True)
+
+    async def test_private_diagnostics_and_public_error_boundaries(self):
+        from carme.security import execution_diagnostic, TASK_INTERRUPTED
+        from carme.api.routes import public_task, public_message, public_event
+        sentinel = 'SECRET_PROVIDER_BODY_/private/credential'
+        execution_diagnostic(self.root, 'model.read', task_id=self.run_id,
+            error=RuntimeError(sentinel), prompt=sentinel, token=sentinel, code='model_interrupted')
+        path = self.root/'diagnostics/execution.jsonl'
+        self.assertNotIn(sentinel, path.read_text())
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        row = {**self.store.get_task(self.run_id), 'status':'failed', 'error':sentinel, 'result':'执行失败：'+sentinel}
+        self.assertNotIn(sentinel, json.dumps(public_task(row)))
+        self.assertEqual(public_message({'role':'assistant','content':'执行失败：'+sentinel})['content'], TASK_INTERRUPTED)
+        self.assertNotIn(sentinel, json.dumps(public_event({'type':'task.failed','payload':{'error':sentinel}})))
+        self.assertEqual(public_message({'role':'user','content':'执行失败：'+sentinel})['content'], '执行失败：'+sentinel)
+        self.assertNotIn(sentinel, json.dumps(public_message({'role':'tool','content':'[工具异常] '+sentinel})))
+        for prefix in ('[抓取失败]', '[搜索失败]', '[抓取来源暂不可用]', '[任务即将截止]'):
+            self.assertNotIn(sentinel, json.dumps(public_message({'role':'tool','content':prefix+' '+sentinel})))
+        self.assertEqual(public_message({'role':'user','content':'[抓取失败] '+sentinel})['content'], '[抓取失败] '+sentinel)
+
+    async def test_resume_and_reconcile_errors_stay_backend_only(self):
+        from fastapi import Depends
+        from unittest.mock import AsyncMock
+        from carme.api.extensions import build_extensions_router
+        from carme.api.routes import require_token
+        sentinel='SECRET_RECONCILIATION_REASON'
+        self.app_.include_router(build_extensions_router(self.config,self.store,self.runtime),
+                                 dependencies=[Depends(require_token)])
+        with patch.dict(os.environ,{'CARME_TOKEN':'synthetic-private-route-token'}), \
+             patch.object(self.runtime,'resume',AsyncMock(side_effect=ValueError(sentinel))), \
+             patch.object(self.store,'operation_reconcile',side_effect=ValueError(sentinel)):
+            headers={'Authorization':'Bearer synthetic-private-route-token'}
+            resumed=await self.client.post('/api/tasks/'+self.run_id+'/resume',headers=headers)
+            reconciled=await self.client.post('/api/tasks/'+self.run_id+'/reconcile',headers=headers,
+                json={'operation_id':'fixture','effect':'confirmed','receipt':{'fixture':True}})
+        self.assertEqual(resumed.status_code,409)
+        self.assertEqual(reconciled.status_code,409)
+        self.assertNotIn(sentinel,resumed.text+reconciled.text)
+
+    async def test_diagnostic_symlink_and_rotation_are_fail_safe(self):
+        from carme.security import execution_diagnostic
+        root = self.root/'private-log'; root.mkdir()
+        target = self.root/'preserve'; target.write_text('PRESERVE')
+        (root/'diagnostics').mkdir(); path=root/'diagnostics/execution.jsonl'; path.symlink_to(target)
+        execution_diagnostic(root,'model.read',task_id=self.run_id)
+        self.assertEqual(target.read_text(), 'PRESERVE'); path.unlink()
+        path.write_bytes(b'x'*(1024*1024))
+        execution_diagnostic(root,'model.read',task_id=self.run_id)
+        self.assertLess(path.stat().st_size, 2048)
+        self.assertTrue((root/'diagnostics/execution.previous.jsonl').is_file())
+
+    async def test_expired_attempt_can_resume_but_not_explicit_contract(self):
+        self.store.checkpoint(self.run_id, {'messages':[],'next_step':1,'memory_refs':[], 'tool_calls':2})
+        self.store.finish_task(self.run_id, '', status='failed', error='private failure')
+        self.store.update_task_meta(self.run_id, {'deadline':time.time()-1, 'deadline_explicit':False})
+        with patch.object(self.runtime, '_schedule') as schedule:
+            await self.runtime.resume(self.run_id)
+            schedule.assert_called_once_with(self.run_id)
+        self.assertGreater(self.runtime._meta(self.store.get_task(self.run_id))['deadline'], time.time())
+        self.assertEqual(self.store.checkpoint(self.run_id)['tool_calls'], 2)
+        self.store.finish_task(self.run_id, '', status='failed')
+        self.store.update_task_meta(self.run_id, {'deadline':time.time()-1, 'deadline_explicit':True})
+        with self.assertRaises(ValueError): await self.runtime.resume(self.run_id)
+
+    async def test_provider_fault_matrix_100_private_streams(self):
+        # Protocol-level fault coverage, not 100 real-provider user tasks.
+        key=self.root/'dedicated-key'; key.write_text('synthetic-key')
+        entry={'protocol':'openai-completions','base_url':'https://fixture.invalid/v1',
+            'models':['fixture/model'],'key_file':str(key), 'allowed_ips':['127.0.0.1']}
+        self.config.isolation['credentials']={'fixture-key':entry}
+        task, job = await self.job()
+        original = httpx.AsyncClient
+        state={'status':200}
+        async def handler(request):
+            if state['status'] == 0: raise httpx.ReadTimeout('SECRET_ERROR_BODY')
+            content = b'data: {"choices":[]}\n\ndata: [DONE]\n\n' if state['status']==200 else b'{"error":{"message":"SECRET_ERROR_BODY"}}'
+            return httpx.Response(state['status'], content=content)
+        statuses=[200,400,401,402,403,429,500,502,503,0]
+        with patch.dict(os.environ, {'CARME_CREDENTIALS_DIR':str(self.root)}), \
+                patch('carme.execution.socket.getaddrinfo', return_value=[(None,None,None,None,('127.0.0.1',443))]), \
+                patch('carme.execution.httpx.AsyncClient', side_effect=lambda **kw: original(transport=httpx.MockTransport(handler), **kw)):
+            for i in range(100):
+                job['model_calls']=0; state['status']=statuses[i % len(statuses)]
+                frames=[frame async for frame in self.runtime.execution.model(job, {'body':{'model':'model','stream':True}})]
+                raw=b''.join(__import__('base64').b64decode(f['body']) for f in frames if f['type']=='chunk')
+                self.assertNotIn(b'SECRET_ERROR_BODY', raw)
+                self.assertIn(frames[-1]['type'], {'end','error'})
+                if state['status']==0: self.assertTrue(frames[-1]['retryable'])
+                else: self.assertEqual(next(f['status'] for f in frames if f['type']=='headers'),state['status'])
+        self.assertNotIn('SECRET_ERROR_BODY',(self.root/'diagnostics/execution.jsonl').read_text())
+        task.cancel(); await asyncio.gather(task,return_exceptions=True)
+
+    async def test_stream_first_chunk_arrives_before_provider_finishes(self):
+        key=self.root/'dedicated-key'; key.write_text('synthetic-key')
+        self.config.isolation['credentials']={'fixture-key':{'protocol':'openai-completions',
+            'base_url':'https://fixture.invalid/v1','models':['fixture/model'],
+            'key_file':str(key),'allowed_ips':['127.0.0.1']}}
+        task, job = await self.job(); release=asyncio.Event(); closed=[]
+        class SlowStream(httpx.AsyncByteStream):
+            async def __aiter__(self):
+                yield b'first'
+                await release.wait()
+                yield b'last'
+            async def aclose(self): closed.append(True)
+        original=httpx.AsyncClient
+        async def handler(request): return httpx.Response(200,stream=SlowStream())
+        with patch.dict(os.environ, {'CARME_CREDENTIALS_DIR':str(self.root)}), \
+                patch('carme.execution.socket.getaddrinfo', return_value=[(None,None,None,None,('127.0.0.1',443))]), \
+                patch('carme.execution.httpx.AsyncClient', side_effect=lambda **kw: original(transport=httpx.MockTransport(handler), **kw)):
+            stream=self.runtime.execution.model(job,{'body':{'model':'model','stream':True}})
+            self.assertEqual((await anext(stream))['type'],'accepted')
+            self.assertEqual((await anext(stream))['type'],'headers')
+            self.assertEqual(__import__('base64').b64decode((await anext(stream))['body']),b'first')
+            self.assertFalse(release.is_set())
+            await stream.aclose()
+            self.assertTrue(closed)
+            self.assertFalse(job['model_active'])
+            release.set(); job['model_active']='first-request'
+            next_stream=self.runtime.execution.model(job,{'body':{'model':'model','stream':True}})
+            async for frame in next_stream:
+                if frame['type']=='end': break
+            self.assertFalse(job['model_active'])
+            job['model_active']='next-request'
+            await next_stream.aclose()
+            self.assertEqual(job['model_active'],'next-request')
+        task.cancel(); await asyncio.gather(task,return_exceptions=True)
+
     async def test_gateway_rejects_private_endpoints_redirect_configuration_and_personal_files(self):
         key = self.root / "dedicated-key"; key.write_text("synthetic-only")
         entry = {"protocol": "openai-completions", "base_url": "https://127.0.0.1/v1",
@@ -287,8 +430,10 @@ class M2(m1.M1):
         with patch.dict(os.environ, {"CARME_CREDENTIALS_DIR": str(self.root)}):
             for url in ("http://127.0.0.1/v1", "https://127.0.0.1/v1", "https://[::1]/v1", "https://169.254.169.254/v1", "https://user:pass@example.com/v1"):
                 entry["base_url"] = url
-                with self.subTest(url=url), self.assertRaises((RuntimeError, ValueError)):
-                    await self.runtime.execution.model(job, {"body": {"model": "model", "messages": []}})
+                with self.subTest(url=url):
+                    frames = [frame async for frame in self.runtime.execution.model(job, {"body": {"model": "model", "messages": []}})]
+                    self.assertEqual(frames[-1], {'type':'error','error':'model_request_denied','retryable':False})
+                    self.assertNotIn('chunk', [f['type'] for f in frames])
             entry["proxy_url"] = "http://localhost:1234"
             with self.assertRaisesRegex(RuntimeError, "credential_configuration_unsupported"):
                 self.runtime.execution.credential(m1.profile())

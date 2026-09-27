@@ -1,7 +1,5 @@
 # Gateway only: existing locked HTTP runtime plus Cloudflare JWT verification.
 -r requirements-control.lock
-PyJWT==2.14.0 \
-    --hash=sha256:ad0cef71c756a56e74863c2919cf0985f72decbcfcb550ee2f422e7c62b5eedc
 cryptography==50.0.1 \
     --hash=sha256:30a125032e5642a21ff816e021152bd4e7e94f03eff3f4b7fca41cd22bc3110f \
     --hash=sha256:9cb3cb952cf5a8abd50c782a98a89d71699715e802fe349704b47f2425b42a94 \

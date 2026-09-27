@@ -54,8 +54,13 @@ TUNNEL_LABEL="com.carme.tunnel"
 TUNNEL_PLIST="${HOME}/Library/LaunchAgents/${TUNNEL_LABEL}.plist"
 TUNNEL_METRICS="127.0.0.1:20247"
 TUNNEL_PIDFILE="${APP}/.local/active/cloudflared.pid"
-# 与 carme-tunnel.yml 的 ingress hostname 保持一致
-CF_HOSTNAME="carme.example.com"
+# 固定域名从隧道配置读取：真值只存在于 app/deploy/cloudflared/carme-tunnel.yml（该文件不入库），
+# 也可用 CARME_CF_HOSTNAME 显式覆盖。这样源码里不需要写死任何真实域名。
+CF_HOSTNAME="${CARME_CF_HOSTNAME:-}"
+if [ -z "${CF_HOSTNAME}" ] && [ -f "${CFG}" ]; then
+  CF_HOSTNAME="$(sed -n 's/^[[:space:]]*-[[:space:]]*hostname:[[:space:]]*\([^[:space:]#]*\).*/\1/p' "${CFG}" | head -1)"
+fi
+CF_HOSTNAME="${CF_HOSTNAME:-carme.example.com}"
 PUBLIC_URL="https://${CF_HOSTNAME}"
 
 OPEN_TARGET="public"   # public = 打开固定域名；local = 打开本机地址

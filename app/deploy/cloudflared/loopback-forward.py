@@ -21,12 +21,20 @@ TARGET_PORT = 8898
 IDLE_TIMEOUT = 300.0
 
 
-async def pipe(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+async def pipe(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, activity: list[float]) -> None:
     try:
         while True:
-            data = await asyncio.wait_for(reader.read(65536), timeout=IDLE_TIMEOUT)
+            try:
+                data = await asyncio.wait_for(reader.read(65536), timeout=IDLE_TIMEOUT)
+            except asyncio.TimeoutError:
+                # SSE clients are silent while the server sends heartbeats.
+                # Only expire a connection when both directions are idle.
+                if asyncio.get_running_loop().time() - activity[0] >= IDLE_TIMEOUT:
+                    break
+                continue
             if not data:
                 break
+            activity[0] = asyncio.get_running_loop().time()
             writer.write(data)
             await writer.drain()
     except (asyncio.TimeoutError, ConnectionError):
@@ -49,10 +57,15 @@ async def handle(client_reader: asyncio.StreamReader, client_writer: asyncio.Str
         except Exception:
             pass
         return
-    await asyncio.gather(
-        pipe(client_reader, upstream_writer),
-        pipe(upstream_reader, client_writer),
-    )
+    activity = [asyncio.get_running_loop().time()]
+    tasks = [asyncio.create_task(pipe(client_reader, upstream_writer, activity)),
+             asyncio.create_task(pipe(upstream_reader, client_writer, activity))]
+    try:
+        await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 async def main() -> None:

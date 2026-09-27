@@ -118,20 +118,24 @@ class CreateArtifactTool(Tool):
         if bool(path) == (content is not None):
             raise ValueError("提供 content 或 path，且只能选一个")
         if path:
-            from ..attachments import archive_binary
             sandbox = await ctx.sandbox()
-            if sandbox.spec.mode != "docker":
-                raise ValueError("binary_artifact_requires_container")
+            if sandbox.spec.mode != 'docker':
+                raise ValueError('binary_artifact_requires_container')
             raw = await sandbox.read_bytes(path)
-            if ctx.extras.get("check_policy"):
-                ctx.extras["check_policy"]()
-            file = archive_binary(ctx.store, cid, name, raw, task_id=ctx.task_id)
         else:
             if len(content) > 500000:
-                raise ValueError("单个成果最多 50 万字符")
-            file = save_file(ctx.store, cid, name, content.encode("utf-8"), task_id=ctx.task_id, kind="artifact")
-        message_id = ctx.store.add_conversation_message(cid, ctx.agent.id, "assistant", "已归档成果", task_id=ctx.task_id)
-        ctx.store._write("UPDATE attachments SET message_id=? WHERE id=?", (message_id, file["id"]))
+                raise ValueError('单个成果最多 50 万字符')
+            raw = content.encode('utf-8')
+        with ctx.store.transaction():
+            ctx.store.publication_scope(ctx.task_id, cid)
+            if ctx.extras.get('check_policy'):ctx.extras['check_policy']()
+            if path:
+                from ..attachments import archive_binary
+                file = archive_binary(ctx.store, cid, name, raw, task_id=ctx.task_id)
+            else:
+                file = save_file(ctx.store, cid, name, raw, task_id=ctx.task_id, kind='artifact')
+            message_id = ctx.store.add_conversation_message(cid, ctx.agent.id, 'assistant', '已归档成果', task_id=ctx.task_id)
+            ctx.store._write('UPDATE attachments SET message_id=? WHERE id=?', (message_id, file['id']))
         await ctx.notify("conversation.message", {"message_id": message_id})
         return json.dumps({"id": file["id"], "name": file["name"], "sha256": file.get("sha256", ""),
                            "status": "已归档，用户可下载；内容未验收"}, ensure_ascii=False)

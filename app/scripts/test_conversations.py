@@ -149,8 +149,8 @@ async def test_api(root: Path) -> None:
     os.environ["CARME_TEST_SECRET"] = "synthetic-test-value-not-a-real-key"
     (directory / "agents.yaml").write_text(yaml.safe_dump({
         "defaults": {"max_steps": 8},
-        "agents": {"a": {"name": "Alpha", "tier": "balanced", "prompt": "${PRESERVE_RAW_REFERENCE}"},
-                   "b": {"name": "Beta", "tier": "balanced"}},
+        "agents": {"a": {"name": "Alpha", "creation_source": "user_created", "tier": "balanced", "prompt": "${PRESERVE_RAW_REFERENCE}"},
+                   "b": {"name": "Beta", "creation_source": "user_created", "tier": "balanced"}},
     }))
     (directory / "models.yaml").write_text(yaml.safe_dump({
         "providers": {"test": {"base_url": "https://example.invalid", "api_key_env": "TEST_UNUSED_KEY"}},

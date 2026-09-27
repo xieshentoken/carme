@@ -5,6 +5,8 @@ import sys
 import tempfile
 import time
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 from pathlib import Path
 
 import httpx
@@ -240,6 +242,34 @@ class GatewayTests(unittest.TestCase):
         with database(self.home) as db:
             dump='\n'.join(db.iterdump())
         for value in (PASSWORD,*self.tokens.values(),self.client.cookies[COOKIE]):self.assertNotIn(value,dump)
+
+    def test_event_stream_survives_two_minutes_and_stops_on_revocation(self):
+        self.login()
+        clock = [time.time()]
+        home = self.home
+        class Stream(httpx.AsyncByteStream):
+            async def __aiter__(self):
+                for _ in range(4):
+                    clock[0] += 61
+                    yield b': heartbeat\n\n'
+            async def aclose(self): pass
+        self.client.app.state.client._transport = httpx.MockTransport(lambda request:
+            httpx.Response(200, headers={'Content-Type':'text/event-stream'}, stream=Stream()))
+        with patch('carme.gateway.time', SimpleNamespace(time=lambda: clock[0])):
+            response = self.client.get('/api/events')
+        self.assertEqual(response.content.count(b'heartbeat'), 4)
+        self.assertEqual(response.headers['x-accel-buffering'], 'no')
+
+        class Revoked(httpx.AsyncByteStream):
+            async def __aiter__(self):
+                yield b': before\n\n'
+                with database(home) as db: db.execute('DELETE FROM sessions')
+                yield b': race\n\n'
+                yield b': must-not-arrive\n\n'
+            async def aclose(self): pass
+        self.client.app.state.client._transport = httpx.MockTransport(lambda request:
+            httpx.Response(200, headers={'Content-Type':'text/event-stream'}, stream=Revoked()))
+        self.assertNotIn(b'must-not-arrive', self.client.get('/api/events').content)
 
 
 if __name__=='__main__':unittest.main(verbosity=2)

@@ -82,6 +82,8 @@ class WebSearchTool(Tool):
         self.tavily_key = os.getenv("TAVILY_API_KEY", "")
 
     async def run(self, ctx: ToolContext, query: str, max_results: int = 8) -> str:
+        if ctx.extras.get('search_source_failed'):
+            return '[搜索来源暂不可用] 本任务已遇到搜索页验证或解析失败；请改用已知网址，或说明检索限制并交付已有结果。'
         limit = max(1, min(int(max_results or 8), 20))
         await ctx.notify("tool.start", {"tool": "web_search", "query": query})
 
@@ -102,6 +104,9 @@ class WebSearchTool(Tool):
                     results = await self._duckduckgo(client, query, limit)
                     engine = "duckduckgo"
             except Exception as exc:  # noqa: BLE001
+                if type(exc) is ValueError and str(exc) == 'duckduckgo_challenge_or_parse_failed':
+                    ctx.extras['search_source_failed'] = True
+                    return '[搜索失败] DuckDuckGo 返回验证页或无法解析的页面；本任务不再重复同源搜索。可抓取已知网址或说明限制。'
                 return f"[搜索失败] {type(exc).__name__}: {exc}\n可以改用 fetch_page 直接抓已知网址。"
 
         await ctx.notify("tool.end", {"tool": "web_search", "engine": engine, "count": len(results)})
@@ -129,6 +134,7 @@ class WebSearchTool(Tool):
             resp = await client.post('https://html.duckduckgo.com/html/', data={'q': query})
         resp.raise_for_status()
         body = resp.text
+        lower = body.lower()
 
         results: list[dict] = []
         # 结果块：标题链接 + 紧随其后的摘要
@@ -146,6 +152,9 @@ class WebSearchTool(Tool):
             results.append({"title": title, "url": url, "snippet": snippet})
             if len(results) >= limit:
                 break
+        if not results and (any(marker in lower for marker in ('anomaly-modal', 'challenge-form', 'captcha-form', 'unusual traffic'))
+                or not any(marker in lower for marker in ('no results found', 'no results.', '没有找到'))):
+            raise ValueError('duckduckgo_challenge_or_parse_failed')
         return results
 
     async def _searx(self, client: httpx.AsyncClient, query: str, limit: int) -> list[dict]:
@@ -196,6 +205,10 @@ class FetchPageTool(Tool):
         "type": "object",
         "properties": {
             "url": {"type": "string", "description": "完整网址，含 https://"},
+            "method": {"type":"string","enum":["GET","HEAD","POST","PUT","PATCH","DELETE"],"description":"默认GET；受限群内其他请求须群主审批"},
+            "body": {"type":"string","description":"待审批发送的文本正文"},
+            "headers": {"type":"object","additionalProperties":{"type":"string"}},
+            "attachment_id": {"type":"string","description":"发送已获准附件的原始字节，与body互斥；须群主审批"},
             "max_chars": {
                 "type": "integer",
                 "description": "最多返回多少字符，默认 12000",
@@ -209,10 +222,21 @@ class FetchPageTool(Tool):
     }
 
     async def run(
-        self, ctx: ToolContext, url: str, max_chars: int = 12000, render: bool = False
+        self, ctx: ToolContext, url: str, max_chars: int = 12000, render: bool = False,
+        method: str = 'GET', body: str = '', headers: dict | None = None, attachment_id: str = ''
     ) -> str:
+        if method != 'GET' or body or headers or attachment_id:
+            raise ValueError('submission_requires_common_approved_relay')
         if not url.startswith(("http://", "https://")):
             url = "https://" + url
+        from urllib.parse import urlsplit
+        source = urlsplit(url).netloc.lower()
+        failures = ctx.extras.setdefault('fetch_failed_sources', set())
+        if source in failures:
+            return '[抓取来源暂不可用] 本任务已收到该来源的 HTTP 403；请换来源或说明限制，勿重复同源抓取。'
+        repeats = ctx.extras.setdefault('fetch_repeats', {})
+        if repeats.get(url, 0) >= 2:
+            return '[抓取来源暂不可用] 本任务已连续两次抓取同一网址失败；请换来源或说明限制。'
         limit = max(500, min(int(max_chars or 12000), 60000))
         await ctx.notify("tool.start", {"tool": "fetch_page", "url": url, "render": render})
 
@@ -220,7 +244,9 @@ class FetchPageTool(Tool):
             if render:
                 raw = await self._render(ctx, url)
             elif ctx.extras.get('http_request'):
-                raw = (await ctx.extras['http_request'](url)).text
+                response = await ctx.extras['http_request'](url)
+                response.raise_for_status()
+                raw = response.text
             else:
                 async with httpx.AsyncClient(
                     timeout=30.0,
@@ -231,6 +257,11 @@ class FetchPageTool(Tool):
                     resp.raise_for_status()
                     raw = resp.text
         except Exception as exc:  # noqa: BLE001
+            repeats[url] = repeats.get(url, 0) + 1
+            if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 403:
+                failures.add(source)
+            elif re.search(r'(?<!\d)(?:HTTP\s*)?403(?!\d)', str(exc), re.I):
+                failures.add(source)
             return f"[抓取失败] {url}：{type(exc).__name__}: {exc}"
 
         text = html_to_text(raw)

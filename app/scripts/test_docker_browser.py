@@ -122,6 +122,25 @@ class Browser(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('authorization', seen[0].headers)
         self.assertEqual(result['status'], 302)
 
+    async def test_reused_connections_never_inject_browser_cookies(self):
+        seen=[];created=[];pool={}
+        client_type=httpx.AsyncClient
+        def request(req):
+            seen.append(req)
+            return httpx.Response(200,headers={'Set-Cookie':'private=must-not-be-injected; Path=/'},content=b'hello')
+        def client(**kwargs):
+            value=client_type(transport=httpx.MockTransport(request),**kwargs);created.append(value);return value
+        try:
+            with patch('carme.docker_browser.public_address',AsyncMock(return_value='93.184.216.34')),patch('carme.docker_browser.httpx.AsyncClient',side_effect=client):
+                for host in ('example.org','example.org','other.example.org'):
+                    await fetch_public({'url':'https://'+host+'/','method':'GET','headers':{},'body':''},{},lambda:None,pool=pool)
+            self.assertEqual(len(created),2)
+            self.assertEqual(len(pool),2)
+            self.assertTrue(all('cookie' not in req.headers for req in seen))
+            self.assertEqual(seen[0].headers['accept-encoding'],'gzip, deflate')
+        finally:
+            for value in created:await value.aclose()
+
     async def test_browser_token_cannot_call_model_shell_or_replay(self):
         ctx = self.configure();ex = self.runtime.execution
         ex.broker_seen = time.time();ex.broker_health = {'browser': 'ready'}
@@ -139,6 +158,48 @@ class Browser(unittest.IsolatedAsyncioTestCase):
         finally:
             task.cancel();await asyncio.gather(task, return_exceptions=True)
             await ex.close_browsers(ctx.task_id)
+
+    async def test_search_challenge_is_distinct_from_empty_results(self):
+        from carme.tools.browser import WebSearchTool
+        ctx=ToolContext(agent=self.config.agents.get('bot'),task_id='fixture',store=None)
+        calls=[]
+        async def challenge(url):
+            calls.append(url)
+            return httpx.Response(200,text='<html>captcha challenge</html>',request=httpx.Request('GET',url))
+        ctx.extras['http_request']=challenge
+        first=await WebSearchTool().run(ctx,'fixture')
+        second=await WebSearchTool().run(ctx,'fixture')
+        self.assertIn('验证页',first)
+        self.assertIn('暂不可用',second)
+        self.assertEqual(len(calls),1)
+        empty=ToolContext(agent=ctx.agent,task_id='other',store=None,
+            extras={'http_request':lambda url: asyncio.sleep(0,result=httpx.Response(200,
+                text='No results found',request=httpx.Request('GET',url)))})
+        self.assertIn('没有搜到',await WebSearchTool().run(empty,'fixture'))
+        async def valid(url):
+            return httpx.Response(200,text='<a class="result__a" href="https://example.com/guide">Captcha challenge guide</a>',
+                                  request=httpx.Request('GET',url))
+        normal=ToolContext(agent=ctx.agent,task_id='normal',store=None,extras={'http_request':valid})
+        self.assertIn('Captcha challenge guide',await WebSearchTool().run(normal,'captcha challenge'))
+        self.assertFalse(normal.extras.get('search_source_failed'))
+
+    async def test_fetch_403_source_and_repeated_url_are_bounded(self):
+        from carme.tools.browser import FetchPageTool
+        ctx=ToolContext(agent=self.config.agents.get('bot'),task_id='fixture',store=None)
+        calls=[];status=403
+        async def request(url):
+            calls.append(url)
+            return httpx.Response(status,text='private fault body',request=httpx.Request('GET',url))
+        ctx.extras['http_request']=request
+        first=await FetchPageTool().run(ctx,'https://example.com/a')
+        second=await FetchPageTool().run(ctx,'https://example.com/b')
+        self.assertIn('403',first)
+        self.assertIn('暂不可用',second)
+        self.assertEqual(len(calls),1)
+        status=404;ctx.extras.clear();ctx.extras['http_request']=request
+        for _ in range(2):self.assertIn('404',await FetchPageTool().run(ctx,'https://other.example/a'))
+        self.assertIn('暂不可用',await FetchPageTool().run(ctx,'https://other.example/a'))
+        self.assertEqual(len(calls),3)
 
 
 if __name__ == '__main__':unittest.main()

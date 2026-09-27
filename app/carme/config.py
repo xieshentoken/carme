@@ -154,6 +154,7 @@ class AgentSpec:
     sandbox: str = "none"
     tools: list[str] = field(default_factory=list)
     prompt: str = ""
+    creation_source: str = "unknown"  # Server-maintained provenance, not an editable profile field.
 
     @property
     def display(self) -> str:
@@ -399,6 +400,7 @@ def load(reload: bool = False) -> Config:
         agent_specs[agent_id] = AgentSpec(
             id=agent_id,
             name=spec.get("name", agent_id),
+            creation_source=str(spec.get("creation_source", "unknown")),
             title=spec.get("title", ""),
             emoji=spec.get("emoji", ""),
             entry=bool(spec.get("entry", False)),
@@ -436,7 +438,7 @@ def load(reload: bool = False) -> Config:
     for agent_id, spec in agent_specs.items():
         if "execution_target" not in raw_agents["agents"][agent_id] and sandbox_cfg.default_node_id:
             spec.execution_target = "ssh"
-    for name, default in {"max_task_seconds": 600, "max_daily_tasks": 200, "max_tool_calls": 32,
+    for name, default in {"max_task_seconds": 600, "max_chat_seconds": 600, "max_daily_tasks": 200, "max_tool_calls": 32,
                           "max_output_bytes": 65536, "max_concurrent_tasks": 3,
                           "max_concurrent_sandbox": 1}.items():
         sandbox_cfg.limit(name, default)

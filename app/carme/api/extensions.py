@@ -113,7 +113,7 @@ def _bots_with_group(config: Config, group: str) -> list[dict]:
     result = []
     for spec in config.agents.agents.values():
         expanded = [str(item) for item in (spec.tools or [])]
-        explicit = {"list_skills", "use_skill"} if group == "skill" else set()
+        explicit = {"list_skills", "use_skill", "install_skill", "remove_skill"} if group == "skill" else set()
         named = any(item.startswith("mcp__") for item in expanded) if group == "mcp" else False
         if group in expanded or explicit & set(expanded) or named:
             result.append({"id": spec.id, "name": spec.name})
@@ -139,7 +139,7 @@ def build_extensions_router(config: Config, store: Store, runtime: Runtime) -> A
     @router.get('/learning')
     async def learning():
         return {'candidates':list(skills.settings().get('candidates',{}).values()),
-                'skill_grants':skills.settings().get('grants',{}),'approved_versions':skills.settings().get('approved_versions',{}),
+                'skill_grants':skills.settings().get('grants',{}),'disabled_by_bot':skills.settings().get('disabled_by_bot',{}),'approved_versions':skills.settings().get('approved_versions',{}),
                 'mcp_grants':mcp.grants,'memory_acl':store._query('SELECT * FROM memory_acl')}
 
     @router.post('/tasks/{task_id}/verify')
@@ -157,14 +157,14 @@ def build_extensions_router(config: Config, store: Store, runtime: Runtime) -> A
     @router.post('/tasks/{task_id}/resume')
     async def resume(task_id: str):
         try:return await runtime.resume(task_id)
-        except (ValueError,RuntimeError) as exc:raise HTTPException(409,str(exc)) from None
+        except (ValueError,RuntimeError):raise HTTPException(409,'任务暂无法继续，请查看任务状态。') from None
 
     @router.post('/tasks/{task_id}/reconcile')
     async def reconcile(task_id: str, body: dict):
         try:
             if set(body)!={'operation_id','effect','receipt'}:raise ValueError('reconciliation_fields_required')
             store.operation_reconcile(task_id,**body);return {'ok':True}
-        except ValueError as exc:raise HTTPException(409,str(exc)) from None
+        except ValueError:raise HTTPException(409,'操作核对未完成，请检查提交信息。') from None
 
     @router.post('/memory-grants')
     async def memory_grant(body: dict):
@@ -182,7 +182,8 @@ def build_extensions_router(config: Config, store: Store, runtime: Runtime) -> A
     async def skill_grant(body: dict):
         try:
             if set(body)-{'bot_id','skill_id','revision','revoke'} or not {'bot_id','skill_id','revision'}<=set(body):raise ValueError('skill_grant_fields_required')
-            config.agents.get(body['bot_id']);skills.grant(**body);return {'ok':True}
+            if body['bot_id'] != '*': config.agents.get(body['bot_id'])
+            skills.grant(**body);return {'ok':True}
         except (KeyError,ValueError,SkillError) as exc:raise HTTPException(422,str(exc)) from None
 
     @router.post('/skill-candidates')
@@ -221,7 +222,8 @@ def build_extensions_router(config: Config, store: Store, runtime: Runtime) -> A
     async def publish(candidate_id: str, body: dict):
         try:
             if set(body)!={'test_task_id','bot_ids','revision','privacy_reviewed'}:raise ValueError('publication_fields_required')
-            for bot in body['bot_ids']:config.agents.get(bot)
+            for bot in body['bot_ids']:
+                if bot != '*': config.agents.get(bot)
             return skills.publish_candidate(store,candidate_id,**body)
         except (ValueError,SkillError,KeyError) as exc:raise HTTPException(422,str(exc)) from None
 
@@ -266,6 +268,8 @@ def build_extensions_router(config: Config, store: Store, runtime: Runtime) -> A
                 if not body.value.strip():
                     raise HTTPException(422, "请填写 owner/repo 或 GitHub 仓库地址")
                 skill = await skills.install_from_github(body.value, subpath=body.subpath, name=body.name)
+            skills.share(skill.id, skills.snapshot(skill.id)['revision'])
+            skill = skills.get(skill.id)
         except SkillError as exc:
             # 安装失败的原因（路径不存在、下载失败、没有 SKILL.md）都要原样告诉人。
             raise HTTPException(422, str(exc)) from None
@@ -290,7 +294,10 @@ def build_extensions_router(config: Config, store: Store, runtime: Runtime) -> A
     @router.patch("/skills/{skill_id}")
     async def update_skill(skill_id: str, body: SkillUpdate) -> dict:
         try:
-            skill = await asyncio.to_thread(skills.set_enabled, skill_id, body.enabled)
+            if body.enabled:
+                # Validate candidate publication before changing the global enabled state.
+                skills.grant('*', skill_id, skills.snapshot(skill_id)['revision'])
+            skill = skills.set_enabled(skill_id, body.enabled)
         except SkillError as exc:
             raise HTTPException(404, str(exc)) from None
         await runtime._emit("skills.updated", {"skill": skill.id}, "", "")

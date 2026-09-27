@@ -80,9 +80,12 @@ class ListAgentsTool(Tool):
         conversation=ctx.store.get_conversation(parent['conversation_id']) if parent.get('conversation_id') else None
         for spec in runtime.config.agents.agents.values():
             if spec.id==ctx.agent.id:continue
-            if conversation and len(conversation['agent_ids'])>1 and spec.id not in conversation['agent_ids']:continue
+            if conversation and conversation['kind']=='group' and spec.id not in conversation['agent_ids']:continue
             try:_,snapshot=runtime._task_agent_snapshot(spec.id,parent)
             except ValueError:continue
+            if ctx.store.task_context(ctx.task_id)['context_mode'] == 'visitor_group':
+                from .base import COMMON_CONTEXT_TOOLS
+                snapshot['policy']['tools'] = sorted(set(snapshot['policy']['tools']) & COMMON_CONTEXT_TOOLS)
             items.append({'id':spec.id,'name':spec.name,'title':spec.title,'tools':snapshot['policy']['tools'],
                           'execution_target':snapshot['execution_target']})
         return json.dumps(items,ensure_ascii=False)

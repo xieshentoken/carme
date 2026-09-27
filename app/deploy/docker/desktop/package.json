@@ -1,0 +1,10 @@
+{
+  "name": "carme-desktop-runtime",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "0.85.1",
+    "@injaneity/pi-computer-use": "0.5.1",
+    "tsx": "4.23.1"
+  }
+}

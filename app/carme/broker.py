@@ -27,7 +27,7 @@ import httpx
 from .engines import _redact
 from .execution import (LEASE_CALL_TIMEOUT, LEASE_RENEW_SECONDS, LEASE_RETRY_SECONDS,
                         MAX_MESSAGE, encoded, signature)
-from .security import bounded_output, child_env
+from .security import bounded_output, child_env, execution_diagnostic
 
 ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,95}\Z")
 IMAGE = re.compile(r"sha256:[a-f0-9]{64}\Z")
@@ -110,8 +110,25 @@ def validate_spec(spec, config):
                 or not re.fullmatch(r'(?:[a-z][a-z0-9-]{0,19})?', payload['browser_channel'])
                 or not isinstance(payload['safety'], dict) or not WEB_TOOLS & set(spec['tools'])):
             raise ValueError('browser_fields_denied')
-    elif set(payload) != {"prompt", "model", "effort", "tools", "max_tool_calls"}:
-        raise ValueError("pi_fields_denied")
+    else:
+        required = {"prompt", "model", "effort", "tools", "max_tool_calls"}
+        optional = {'model_limits'}
+        if 'session' in payload:
+            required |= {'session', 'messages', 'system_prompt'}
+            session = payload['session']
+            if (not isinstance(session, dict) or set(session) != {'scope', 'epoch', 'task_id'}
+                    or not isinstance(session['scope'], str) or not ID.fullmatch(session['scope'])
+                    or not re.fullmatch(r'[a-f0-9]{64}', str(session['epoch'])) or session['task_id'] != spec['run_id']
+                    or not isinstance(payload['messages'], list) or not isinstance(payload['system_prompt'], str)):
+                raise ValueError('pi_session_binding_denied')
+        if set(payload) - required - optional or required - set(payload):
+            raise ValueError('pi_fields_denied')
+        limits = payload.get('model_limits', {'context_window': 32768, 'max_output_tokens': 8192})
+        if (not isinstance(limits, dict) or set(limits) != {'context_window', 'max_output_tokens'}
+                or any(type(n) is not int for n in limits.values())
+                or not 4096 <= limits['context_window'] <= 2_000_000
+                or not 256 <= limits['max_output_tokens'] < limits['context_window']):
+            raise ValueError('pi_model_limits_denied')
     return spec
 
 
@@ -141,8 +158,14 @@ class Broker:
         self.env["DOCKER_CONFIG"] = config["docker_config"]
         self.active: dict[str, tuple[str, asyncio.Task]] = {}
         self.browser_profiles: set[tuple[str, str]] = set()
+        self.pi_sessions: set[tuple[str, str, str]] = set()
+        self.desktops: dict[str, dict] = {}
+        self.desktop_start_lock = asyncio.Lock()
+        self.desktop_tasks: set[asyncio.Task] = set()
         self.client = httpx.AsyncClient(base_url=config["control_url"], trust_env=False,
             verify=config.get("control_ca_file", True), timeout=10, follow_redirects=False)
+        self.relay_client = httpx.AsyncClient(base_url=config['control_url'], trust_env=False,
+            verify=config.get('control_ca_file', True), timeout=330, follow_redirects=False)
         self.health = {"action": "unverified", "pi": "unverified"}
         self.health["images"] = dict(config["images"])
         self.health["max_pi"] = int(config.get("max_pi", 2))
@@ -241,7 +264,13 @@ class Broker:
                 "--tmpfs=/runtime:rw,nosuid,nodev,size=128m,uid=1000,gid=1000,mode=700", "--interactive"]
         # The Worker never sees host path spellings, a whole CARME_HOME, or another run.
         if spec["role"] == "action":
-            run = self.directory("runtime", "runs", spec["run_id"])
+            parts = ('runtime', 'runs', spec['run_id'])
+            if self.config.get('desktop'):
+                from .account_disk import checked
+                checked(self.home)
+                parts = ('storage', 'mount', 'runs', spec['bot_id'], spec['run_id'])
+            run = self.directory(*parts)
+            if self.config.get('desktop'): run.chmod(0o755)
             owner = run / "owner.json"
             expected = {"instance_id": spec["instance_id"], "bot_id": spec["bot_id"], "run_id": spec["run_id"]}
             if owner.exists():
@@ -251,7 +280,7 @@ class Broker:
                 with owner.open("x") as f:
                     json.dump(expected, f)
             for sub in ("workspace", "inputs", "out"):
-                path = self.directory("runtime", "runs", spec["run_id"], sub)
+                path = self.directory(*parts, sub)
                 # The parent is Broker-owned; the mount roots alone are writable by UID 1000.
                 path.chmod(0o777 if sub != "inputs" else 0o755)
                 if "," in str(path):
@@ -273,6 +302,15 @@ class Broker:
                     with path.open('xb') as stream:stream.write(raw)
                     path.chmod(0o444)
             args += ["--workdir=/workspace"]
+        elif spec['role'] == 'pi' and spec['payload'].get('session'):
+            session = spec['payload']['session']
+            path = self.directory('runtime', 'control', 'pi-sessions', session['scope'], spec['bot_id'], session['epoch'])
+            for item in path.iterdir():
+                if item.is_symlink() or not item.is_file():
+                    raise ValueError('pi_session_file_denied')
+            if ',' in str(path):
+                raise ValueError('mount_path_comma_unsupported')
+            args += ['--mount', f'type=bind,src={path},dst=/session']
         elif spec['role'] == 'browser':
             profile = self.directory('runtime', 'browser', spec['bot_id'], spec['payload']['profile'])
             profile.chmod(0o777)
@@ -306,14 +344,33 @@ class Broker:
         tasks = []
         relays = set()
         browser_identity = None
+        pi_identity = None
         cleanup_ok = False
         relay_failure = asyncio.get_running_loop().create_future()
         stderr_task = None
         stderr_tail = bytearray()
+        write_lock = asyncio.Lock()
+        started = time.monotonic()
+        def diagnostic(stage, **fields):
+            execution_diagnostic(self.home / 'runtime' / 'broker', stage,
+                task_id=spec['run_id'], job_id=spec['job_id'], **fields)
+        async def write(value):
+            async with write_lock:
+                proc.stdin.write(encoded(value) + b"\n")
+                async with asyncio.timeout(30):
+                    await proc.stdin.drain()
         def relay_done(task):
             if not task.cancelled() and task.exception() and not relay_failure.done():
                 relay_failure.set_exception(task.exception())
         try:
+            if spec['role'] == 'pi' and spec['payload'].get('session'):
+                validate_spec(spec, self.config)
+                session = spec['payload']['session']
+                identity = (session['scope'], spec['bot_id'], session['epoch'])
+                if identity in self.pi_sessions:
+                    raise RuntimeError('pi_session_busy: previous worker cleanup not complete')
+                self.pi_sessions.add(identity)
+                pi_identity = identity
             if spec['role'] == 'browser':
                 validate_spec(spec, self.config)
                 identity = (spec['bot_id'], spec['payload']['profile'])
@@ -327,18 +384,21 @@ class Broker:
                 self.config["docker_context"], "start", "--attach", "--interactive", name,
                 env=self.env, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE, limit=MAX_MESSAGE + 1, start_new_session=True)
-            proc.stdin.write(encoded({"role": spec["role"], "payload": spec["payload"],
-                "max_output_bytes": spec["max_output_bytes"]}) + b"\n")
-            await proc.stdin.drain()
+            await write({"role": spec["role"], "payload": spec["payload"],
+                "deadline": spec['deadline'], "max_output_bytes": spec["max_output_bytes"]})
+            diagnostic('worker.started', elapsed_ms=round((time.monotonic()-started)*1000))
 
             async def renew():
                 confirmed = time.monotonic()
                 while True:
                     await asyncio.sleep(LEASE_RENEW_SECONDS)
+                    renew_started = time.monotonic()
                     try:
                         response = await self.call({"op": "renew", "job_id": spec["job_id"], "lease": lease},
                                                    timeout=LEASE_CALL_TIMEOUT)
-                    except Exception:
+                    except Exception as exc:
+                        diagnostic('lease.renew', error=exc,
+                            elapsed_ms=round((time.monotonic()-renew_started)*1000))
                         # Silence is not a revoked lease: keep asking, so a stalled host does not
                         # fail a job whose tools already ran. Only an authoritative refusal below,
                         # this retry budget, the task deadline and cleanup end it.
@@ -346,10 +406,10 @@ class Broker:
                             raise
                         continue
                     if not response.get("active"):
+                        diagnostic('lease.revoked', code='execution_lease_revoked')
                         raise RuntimeError("execution_lease_revoked")
                     confirmed = time.monotonic()
-                    proc.stdin.write(b'{"type":"lease"}\n')
-                    await proc.stdin.drain()
+                    await write({'type':'lease'})
 
             async def stderr():
                 total = 0
@@ -361,22 +421,49 @@ class Broker:
                     if total > spec["max_output_bytes"]:
                         raise RuntimeError("worker_stderr_limit")
 
-            async def relay(message):
-                async with self.client.stream("POST", f"/internal/runs/{spec['run_id']}/messages",
-                        json=message, headers={"Authorization": "Bearer " + claim["task_token"]}, timeout=600) as response:
-                    # Control validates the task token; responses are HMAC-bound too.
-                    response.raise_for_status()
-                    raw = bytearray()
-                    async for chunk in response.aiter_bytes():
-                        raw.extend(chunk)
-                        if len(raw) > MAX_MESSAGE:
-                            raise RuntimeError("relay_response_limit")
-                    expected = signature(claim["task_token"].encode(), message["event_id"], raw)
-                    if not hmac.compare_digest(expected, response.headers.get("X-Carme-Signature", "")):
-                        raise RuntimeError("relay_signature_invalid")
-                    reply = json.loads(raw)
-                proc.stdin.write(encoded({"id": message["event_id"], **reply}) + b"\n")
-                await proc.stdin.drain()
+            async def relay(message, accepted=None):
+                relay_started = time.monotonic()
+                try:
+                    async with self.relay_client.stream("POST", f"/internal/runs/{spec['run_id']}/messages",
+                            json=message, headers={"Authorization": "Bearer " + claim["task_token"]},
+                            timeout=330 if message['kind'] == 'model' else 600) as response:
+                        response.raise_for_status()
+                        if response.headers.get('X-Carme-Stream') == '1':
+                            if message['kind'] != 'model': raise RuntimeError('unexpected_relay_stream')
+                            if accepted is not None: accepted.set()
+                            buffer = bytearray()
+                            count = 0
+                            ended = False
+                            async for chunk in response.aiter_bytes():
+                                buffer.extend(chunk)
+                                while b'\n' in buffer:
+                                    line, _, tail = buffer.partition(b'\n'); buffer = bytearray(tail)
+                                    if len(line) > 65536 or ended: raise RuntimeError('relay_frame_denied')
+                                    frame = json.loads(line); count += 1
+                                    if (set(frame) != {'sequence','data','signature'} or frame['sequence'] != count or
+                                            not hmac.compare_digest(frame['signature'], signature(claim['task_token'].encode(),
+                                                message['event_id'] + ':' + str(message['sequence']) + ':' + str(count), encoded(frame['data'])))):
+                                        raise RuntimeError('relay_signature_invalid')
+                                    ended = frame['data'].get('type') in {'end','error'}
+                                    await write({'id':message['event_id'], 'frame':frame['data']})
+                                if len(buffer) > 65536: raise RuntimeError('relay_frame_limit')
+                            if buffer or not ended: raise RuntimeError('relay_stream_incomplete')
+                            return
+                        raw = bytearray()
+                        async for chunk in response.aiter_bytes():
+                            raw.extend(chunk)
+                            if len(raw) > MAX_MESSAGE: raise RuntimeError("relay_response_limit")
+                        expected = signature(claim["task_token"].encode(), message["event_id"], raw)
+                        if not hmac.compare_digest(expected, response.headers.get("X-Carme-Signature", "")):
+                            raise RuntimeError("relay_signature_invalid")
+                        reply = json.loads(raw)
+                    await write({"id": message["event_id"], **reply})
+                except Exception as exc:
+                    diagnostic('relay.' + message['kind'], error=exc,
+                        elapsed_ms=round((time.monotonic()-relay_started)*1000))
+                    raise
+                finally:
+                    if accepted is not None: accepted.set()
 
             async def read():
                 sequence = 0
@@ -396,16 +483,21 @@ class Broker:
                             raise RuntimeError("worker_rpc_fields_denied")
                         sequence += 1
                         message = {"sequence": sequence, "event_id": data["id"], "kind": data["kind"], "payload": data["payload"]}
-                        if spec['role'] == 'browser':
+                        if spec['role'] == 'browser' or data['kind'] == 'model':
                             for finished in list(relays):
                                 if finished.done():
                                     finished.result()
                                     relays.remove(finished)
                             if len(relays) >= 32:
                                 raise RuntimeError('browser_relay_concurrency_limit')
-                            relay_task = asyncio.create_task(relay(message))
+                            accepted = asyncio.Event() if data['kind'] == 'model' else None
+                            relay_task = asyncio.create_task(relay(message, accepted))
                             relay_task.add_done_callback(relay_done)
                             relays.add(relay_task)
+                            if accepted is not None:
+                                # Control has consumed this sequence before accepting the next RPC.
+                                await accepted.wait()
+                                if relay_task.done(): relay_task.result()
                         else:
                             await relay(message)
                     else:
@@ -426,6 +518,7 @@ class Broker:
                         task.result()
                 result = tasks[0].result()
         except (Exception, asyncio.CancelledError) as exc:
+            diagnostic('worker.run', error=exc, elapsed_ms=round((time.monotonic()-started)*1000))
             result = {"error": "container_execution_failed:" + type(exc).__name__ + ":" +
                       (str(exc)[:140] if isinstance(exc, (ValueError, RuntimeError)) else "no host fallback")}
         finally:
@@ -459,6 +552,11 @@ class Broker:
                     self.browser_profiles.discard(browser_identity)
                 else:
                     self.health['browser'] = 'cleanup_pending'
+            if pi_identity:
+                if not name or cleanup_ok:
+                    self.pi_sessions.discard(pi_identity)
+                else:
+                    self.health['pi'] = 'cleanup_pending'
             with contextlib.suppress(Exception):
                 await self.call({"op": "finish", "job_id": spec["job_id"], "lease": lease,
                                  "result": result}, timeout=LEASE_CALL_TIMEOUT)
@@ -472,6 +570,9 @@ class Broker:
             if not raw:
                 continue
             labels = json.loads(raw)
+            if labels.get('carme.instance') == self.config['instance_id'] and labels.get('carme.role') == 'desktop' and ID.fullmatch(labels.get('carme.bot', '')):
+                await self.docker('rm', '-f', name)
+                continue
             if labels.get("carme.instance") == self.config["instance_id"] and ID.fullmatch(labels.get("carme.job", "")):
                 await self.remove(name, {"job_id": labels["carme.job"]})
         for receipt in self.directory("runtime", "broker").glob("*.json"):
@@ -482,7 +583,7 @@ class Broker:
                 raise RuntimeError("cleanup_receipt_owner_mismatch")
             await self.remove(record["container"], record)
             receipt.unlink()
-        for role in ('pi', 'action', *(['browser'] if 'browser' in self.config['images'] else [])):
+        for role in ('pi', 'action', *([r for r in ('browser', 'desktop') if r in self.config['images']])):
             image = self.config["images"][role]
             if not IMAGE.fullmatch(image):
                 raise ValueError("image_digest_required")
@@ -497,8 +598,34 @@ class Broker:
         import fcntl
         lock = (self.directory("runtime", "broker") / "broker.lock").open("a")
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        desktop_poller = None
         try:
             await self.startup()
+            async def desktop_job(request):
+                from .docker_desktop import DesktopNoEffectError, broker_desktop_request
+                try: result = await broker_desktop_request(self, request)
+                except Exception as exc:
+                    result = {'error': str(exc)[:600]}
+                    if isinstance(exc, DesktopNoEffectError):
+                        result['effect'] = 'not_performed'
+                        if exc.status_code is not None: result['http_status'] = exc.status_code
+                with contextlib.suppress(Exception):
+                    await self.call({'op': 'desktop_finish', 'id': request['id'], 'result': result})
+            async def desktop_loop():
+                while not self.stopping:
+                    try:
+                        if len(self.desktop_tasks) >= 8:
+                            await asyncio.wait(self.desktop_tasks, return_when=asyncio.FIRST_COMPLETED)
+                            continue
+                        request = await self.call({'op': 'desktop_claim', 'wait': 2}, timeout=5)
+                        if request:
+                            task = asyncio.create_task(desktop_job(request))
+                            self.desktop_tasks.add(task)
+                            task.add_done_callback(self.desktop_tasks.discard)
+                    except Exception:
+                        await asyncio.sleep(.25)
+            if self.config.get('desktop'):
+                desktop_poller = asyncio.create_task(desktop_loop())
             while not self.stopping:
                 self.active = {j: value for j, value in self.active.items() if not value[1].done()}
                 counts = {r: sum(v[0] == r for v in self.active.values()) for r in self.config['images'] if r in {'pi', 'action', 'browser'}}
@@ -510,15 +637,29 @@ class Broker:
                         spec = claim["spec"]
                         task = asyncio.create_task(self.run_job(claim))
                         self.active[spec["job_id"]] = (spec["role"], task)
+                    if self.config.get('desktop'):
+                        from .docker_desktop import stop_desktop
+                        for bot_id, entry in list(self.desktops.items()):
+                            if not entry['pending'] and time.monotonic() - entry['last_used'] > 120:
+                                await stop_desktop(self, bot_id)
                 except Exception:
                     # No daemon/context fallback and no replay. Existing jobs lose their lease fast.
                     pass
                 await asyncio.sleep(0.25)
         finally:
+            if desktop_poller:
+                desktop_poller.cancel()
+                await asyncio.gather(desktop_poller, return_exceptions=True)
+            for task in self.desktop_tasks: task.cancel()
+            await asyncio.gather(*self.desktop_tasks, return_exceptions=True)
+            from .docker_desktop import stop_desktop
+            for bot_id in list(self.desktops):
+                with contextlib.suppress(Exception): await stop_desktop(self, bot_id)
             for _, task in self.active.values():
                 task.cancel()
             await asyncio.gather(*(v[1] for v in self.active.values()), return_exceptions=True)
             await self.client.aclose()
+            await self.relay_client.aclose()
             lock.close()
 
 

@@ -304,11 +304,15 @@ class M4Runtime(unittest.IsolatedAsyncioTestCase):
         for payload in ({'input_artifact_ids':[{}]},{'budget':[]},{'input_artifact_ids':['foreign']}):
             with self.assertRaises(ValueError):await self.runtime.submit_message(cid,'bad',str(payload),envelope=payload)
         good=await self.runtime.submit_message(cid,'valid','valid');parent=self.store.get_task(good['task_id'])
-        other=self.store.create_task('bot','other',conversation_id=cid)
-        artifact=archive_binary(self.store,cid,'other.txt',b'private other task',task_id=other)
+        other=self.store.create_task('foreign-bot','other',conversation_id=cid)
+        artifact=archive_binary(self.store,cid,'other.txt',b'private other bot',task_id=other)
         _,meta=self.runtime._task_agent_snapshot('bot',parent)
         child=self.store.create_task('bot','child',parent_id=parent['id'],conversation_id=cid,meta=meta)
         with self.assertRaisesRegex(ValueError,'artifact_version_not_granted'):self.runtime.bind_envelope(child,{'input_artifact_ids':[artifact['id']]})
+        own=self.store.create_task('bot','own earlier task',conversation_id=cid)
+        own_file=archive_binary(self.store,cid,'own.txt',b'own bot reusable input',task_id=own)
+        contract=self.runtime.bind_envelope(child,{'input_artifact_ids':[own_file['id']]})
+        self.assertEqual(contract['input_artifacts'][0]['id'],own_file['id'])
     async def test_resume_denies_descendant_effect_and_changed_policy(self):
         cid=self.store.create_conversation(['bot'])['id'];result=await self.runtime.submit_message(cid,'goal','root')
         tid=result['task_id'];self.store.finish_task(tid,'interrupted',status='failed')

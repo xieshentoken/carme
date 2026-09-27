@@ -281,6 +281,9 @@ class BrowserSession:
         viewport = self.settings.get("viewport") or {"width": 1366, "height": 900}
         launch_args = ["--no-first-run", "--no-default-browser-check", "--disable-blink-features=AutomationControlled"]
         relay = self.settings.get('docker_relay')
+        desktop = self.settings.get('desktop_runtime') is True
+        if desktop:
+            launch_args += ['--remote-debugging-address=127.0.0.1', '--remote-debugging-port=9222', '--force-renderer-accessibility']
         if relay:
             launch_args += ['--disable-background-networking', '--disable-quic', '--disable-sync']
         if not (headless if headless is not None else self.headless):
@@ -298,6 +301,7 @@ class BrowserSession:
                 headless=headless if headless is not None else self.headless,
                 user_agent=user_agent or None,
                 channel=self.settings.get("channel") or None,
+                executable_path='/software/chrome/chrome' if desktop else None,
                 viewport=viewport,
                 locale=self.settings.get("locale", "zh-CN"),
                 timezone_id=self.settings.get("timezone", "Asia/Shanghai"),

@@ -61,13 +61,16 @@ async def request_approval(
 
     on_event 负责推给界面（SSE），notifier 负责推到手机。两者都可以没有。
     """
-    approval_id = store.create_approval(
-        task_id=task_id,
-        agent_id=agent_id,
-        kind=kind,
-        summary=summary,
-        detail=detail or {},
-    )
+    with store.transaction():
+        if kind == 'visitor_http':
+            store.publication_scope(task_id, (detail or {}).get('origin', {}).get('conversation_id',''))
+        approval_id = store.create_approval(
+            task_id=task_id,
+            agent_id=agent_id,
+            kind=kind,
+            summary=summary,
+            detail=detail or {},
+        )
 
     if on_event is not None:
         await on_event(
@@ -85,39 +88,51 @@ async def request_approval(
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
 
-    while True:
-        row = store.get_approval(approval_id)
-        if row is None:
-            return ApprovalOutcome(False, "审批记录丢失")
+    try:
+        while True:
+            row = store.get_approval(approval_id)
+            if row is None:
+                return ApprovalOutcome(False, "审批记录丢失")
 
-        status = row["status"]
-        if status == "approved":
-            if on_event is not None:
-                await on_event("approval.decided", {"approval_id": approval_id, "approved": True})
-            return ApprovalOutcome(True, row.get("note") or "")
-        if status == "rejected":
-            if on_event is not None:
-                await on_event("approval.decided", {"approval_id": approval_id, "approved": False})
-            return ApprovalOutcome(False, row.get("note") or "用户拒绝了这一步")
+            if kind == 'visitor_http':
+                try:
+                    store.publication_scope(task_id, (detail or {}).get('origin', {}).get('conversation_id',''))
+                except ValueError:
+                    store.decide_approval(approval_id, approved=False, note='conversation_context_changed')
+                    return ApprovalOutcome(False, '群权限已变化')
+            status = row["status"]
+            if status == "approved":
+                if on_event is not None:
+                    await on_event("approval.decided", {"approval_id": approval_id, "approved": True})
+                return ApprovalOutcome(True, row.get("note") or "")
+            if status == "rejected":
+                if on_event is not None:
+                    await on_event("approval.decided", {"approval_id": approval_id, "approved": False})
+                return ApprovalOutcome(False, row.get("note") or "用户拒绝了这一步")
 
-        if loop.time() >= deadline:
-            store.decide_approval(approval_id, approved=False, note="等待超时，按拒绝处理")
-            if on_event is not None:
-                await on_event(
-                    "approval.timeout", {"approval_id": approval_id, "seconds": int(timeout)}
+            if loop.time() >= deadline:
+                store.decide_approval(approval_id, approved=False, note="等待超时，按拒绝处理")
+                if on_event is not None:
+                    await on_event(
+                        "approval.timeout", {"approval_id": approval_id, "seconds": int(timeout)}
+                    )
+                if notifier is not None:
+                    asyncio.create_task(
+                        notifier.approval_timeout(summary, seconds=int(timeout))
+                    )
+                return ApprovalOutcome(
+                    False,
+                    f"等待人工确认超过 {int(timeout)} 秒没有回应，已按拒绝处理。"
+                    "如果这是误判，请让用户调整 config/browser.yaml 的 dangerous_patterns。",
+                    timed_out=True,
                 )
-            if notifier is not None:
-                asyncio.create_task(
-                    notifier.approval_timeout(summary, seconds=int(timeout))
-                )
-            return ApprovalOutcome(
-                False,
-                f"等待人工确认超过 {int(timeout)} 秒没有回应，已按拒绝处理。"
-                "如果这是误判，请让用户调整 config/browser.yaml 的 dangerous_patterns。",
-                timed_out=True,
-            )
 
-        await asyncio.sleep(POLL_INTERVAL)
+            await asyncio.sleep(POLL_INTERVAL)
+    except asyncio.CancelledError:
+        store.decide_approval(approval_id, approved=False, note="操作已取消或权限已变化，未执行")
+        if on_event is not None:
+            await on_event("approval.decided", {"approval_id": approval_id, "approved": False})
+        raise
 
 
 __all__ = ["ApprovalOutcome", "request_approval"]

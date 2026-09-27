@@ -10,6 +10,7 @@ CONFIG=${CARME_CLOUDFLARE_CONFIG:-$ROOT_DIR/deploy/cloudflared/carme-tunnel.yml}
 ENV_FILE=${CARME_ENV_FILE:-$ROOT_DIR/.local/active/.env}
 PID_FILE=${CARME_CLOUDFLARE_PID_FILE:-$ROOT_DIR/.local/active/cloudflared.pid}
 LOG_FILE=${CARME_CLOUDFLARE_LOG_FILE:-$ROOT_DIR/.local/active/cloudflared.log}
+ORIGIN_PORT="${CARME_ORIGIN_PORT:-8899}"
 
 case "$CONFIG" in
   /*) ;;
@@ -100,7 +101,7 @@ validate_config() {
     printf '%s\n' 'FAIL: 未找到可读取配置的 Python。' >&2
     return 1
   }
-  "$python" - "$CONFIG" <<'PY'
+  CARME_ORIGIN_PORT="$ORIGIN_PORT" "$python" - "$CONFIG" <<'PY'
 import os
 import re
 import sys
@@ -114,6 +115,7 @@ except ImportError:
     raise SystemExit(1)
 
 path = Path(sys.argv[1])
+origin_port = int(os.environ["CARME_ORIGIN_PORT"])
 try:
     raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
 except (OSError, UnicodeError, yaml.YAMLError):
@@ -157,13 +159,13 @@ for item in ingress:
     try:
         parsed = urlsplit(service)
         origin_ok = (parsed.scheme == "http" and parsed.hostname == "127.0.0.1"
-                     and parsed.port == 8899 and parsed.path.rstrip("/") == ""
+                     and parsed.port == origin_port and parsed.path.rstrip("/") == ""
                      and not parsed.username and not parsed.password
                      and not parsed.query and not parsed.fragment)
     except ValueError:
         origin_ok = False
     if origin_ok and not hostname:
-        fail("指向 127.0.0.1:8899 的 ingress 必须有固定 hostname。")
+        fail(f"指向 127.0.0.1:{origin_port} 的 ingress 必须有固定 hostname。")
     if not hostname:
         continue
     labels = hostname.split(".")
@@ -178,7 +180,7 @@ for item in ingress:
 
 expected = os.environ.get("CARME_CLOUDFLARE_HOSTNAME", "").strip().lower().rstrip(".")
 if len(origin_routes) != 1 or not origin_routes[0][1]:
-    fail("必须恰好有一个指向 127.0.0.1:8899 的固定域名 ingress。")
+    fail(f"必须恰好有一个指向 127.0.0.1:{origin_port} 的固定域名 ingress。")
 target_hostname, _, target_item = origin_routes[0]
 if expected and target_hostname != expected:
     fail("配置域名与 CARME_CLOUDFLARE_HOSTNAME 不一致。")
@@ -206,7 +208,7 @@ check_backend_auth() {
     printf '%s\n' 'FAIL: 无法读取 CARME_TOKEN；不会启动公网入口。' >&2
     return 1
   }
-  CARME_CHECK_TOKEN="$token" "$python" - "http://127.0.0.1:8899/api/health" <<'PY'
+  CARME_CHECK_TOKEN="$token" "$python" - "http://127.0.0.1:${ORIGIN_PORT}/api/health" <<'PY'
 import os
 import sys
 from urllib.error import HTTPError, URLError
@@ -227,12 +229,12 @@ def status(request):
 without_token = status(Request(url))
 with_token = status(Request(url, headers={"Authorization": "Bearer " + token}))
 if without_token != 401:
-    print("FAIL: 当前 8899 /api/health 未在无令牌请求时返回 401；请先配置 CARME_TOKEN 并重启现有服务。", file=sys.stderr)
+    print(f"FAIL: 当前 {url} 未在无令牌请求时返回 401；请先配置 CARME_TOKEN 并重启现有服务。", file=sys.stderr)
     raise SystemExit(1)
 if with_token != 200:
-    print("FAIL: 当前 8899 /api/health 未接受配置的 CARME_TOKEN；请核对 .env 与运行进程后重启。", file=sys.stderr)
+    print(f"FAIL: 当前 {url} 未接受配置的 CARME_TOKEN；请核对 .env 与运行进程后重启。", file=sys.stderr)
     raise SystemExit(1)
-print("OK: 当前 8899 已验证为 CARME_TOKEN 保护（无令牌=401，正确令牌=200；令牌值未输出）。")
+print(f"OK: 当前 {url} 已验证为 CARME_TOKEN 保护（无令牌=401，正确令牌=200；令牌值未输出）。")
 PY
 }
 

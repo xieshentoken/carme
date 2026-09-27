@@ -56,8 +56,19 @@ async def public_address(host, port):
     return sorted(addresses)[0]
 
 
-async def fetch_public(data, safety, check):
-    """No redirects in this call, no pooling/re-resolution, no credential injection."""
+def is_submission(data):
+    """Writes and explicit action URLs need consent, independently of the UI tool."""
+    from urllib.parse import parse_qsl, unquote
+    url = urlsplit(web_url(data['url']))
+    actions = r'(?:send|submit|publish|upload|delete|remove|unsubscribe|pay|purchase|checkout|transfer|authorize)'
+    action_url = re.search(r'(?:^|/)' + actions + r'(?:$|/)' , unquote(url.path).lower())
+    action_query = any(k.lower() in {'action', 'op', 'command', 'do'} and re.fullmatch(actions, v.lower())
+                       for k, v in parse_qsl(url.query))
+    return data.get('method') not in {'GET', 'HEAD', 'OPTIONS'} or bool(data.get('body')) or bool(action_url or action_query)
+
+
+async def fetch_public(data, safety, check, *, sink=None, max_bytes=MAX_BODY, pool=None, authorize=None):
+    """Pin each request to a checked public IP; pools are owned by one Bot only."""
     if not isinstance(data, dict) or set(data) != {'url', 'method', 'headers', 'body'}:
         raise ValueError('browser_request_fields_denied')
     value = web_url(data['url'])
@@ -81,18 +92,43 @@ async def fetch_public(data, safety, check):
     if len(json.dumps(headers).encode()) > 32768:
         raise ValueError('browser_headers_limit')
     headers['Host'] = url.netloc.decode('ascii')
-    headers['Accept-Encoding'] = 'identity'
+    headers['Accept-Encoding'] = 'gzip, deflate'
     address = await public_address(host, url.port or (443 if url.scheme == 'https' else 80))
     check()
-    async with httpx.AsyncClient(trust_env=False, follow_redirects=False, timeout=20) as client:
-        async with client.stream(data['method'], url.copy_with(host=address), headers=headers,
-                                 content=raw, extensions={'sni_hostname': host}) as response:
-            output = bytearray()
+    if authorize and is_submission(data):
+        # Approval is before opening the outbound connection, after validating its destination.
+        await authorize()
+        check()
+    key = (url.scheme, host, url.port, address)
+    entry = pool.get(key) if pool is not None else None
+    if entry is None:
+        if pool is not None and len(pool) >= 32:
+            idle = next((k for k, v in pool.items() if not v['active']), None)
+            if idle is not None:
+                await pool.pop(idle)['client'].aclose()
+        entry = {'client': httpx.AsyncClient(trust_env=False, follow_redirects=False, timeout=20,
+            limits=httpx.Limits(max_connections=24, max_keepalive_connections=8, keepalive_expiry=15)), 'active': 0}
+        if pool is not None and len(pool) < 32:
+            pool[key] = entry
+    entry['active'] += 1
+    client = entry['client']
+    response = None
+    try:
+        # Construct the request directly: never merge the HTTP client's cookie jar,
+        # headers or credentials into the browser's explicit per-request headers.
+        request = httpx.Request(data['method'], url.copy_with(host=address), headers=headers,
+            content=raw, extensions={'sni_hostname': host, 'timeout': {'connect':20,'read':20,'write':20,'pool':20}})
+        response = await client.send(request, stream=True)
+        try:
+            output = bytearray(); received = 0
             async for chunk in response.aiter_bytes():
                 check()
-                output.extend(chunk)
-                if len(output) > MAX_BODY:
+                received += len(chunk)
+                if received > max_bytes:
                     raise ValueError('browser_response_limit')
+                if sink is not None:
+                    if response.status_code == 200: sink(chunk)
+                else: output.extend(chunk)
             # Decoded bytes: strip compression/framing. Preserve separate Set-Cookie fields.
             response_headers = [[k, v] for k, v in response.headers.multi_items()
                 if k.lower() not in {'content-encoding', 'content-length', 'transfer-encoding',
@@ -100,7 +136,14 @@ async def fetch_public(data, safety, check):
             if len(json.dumps(response_headers).encode()) > 65536:
                 raise ValueError('browser_response_headers_limit')
             return {'status': response.status_code, 'headers': response_headers,
+                    'bytes': received,
                     'body': base64.b64encode(output).decode()}
+        finally:
+            await response.aclose()
+    finally:
+        entry['active'] -= 1
+        if pool is None or pool.get(key) is not entry:
+            await client.aclose()
 
 
 async def serve(payload, rpc):

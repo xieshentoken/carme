@@ -1,6 +1,6 @@
-"""Optional paired native runner. Local grants plus Control approval; no shell or Pi."""
+"""Paired native runner: explicit local GUI grants, no host shell or model runtime."""
 from __future__ import annotations
-import argparse, asyncio, contextlib, fcntl, hashlib, hmac, json, math, os, re, secrets, signal, stat, sys, tempfile, threading, time
+import argparse, asyncio, base64, subprocess, contextlib, fcntl, hashlib, hmac, json, math, os, re, secrets, signal, stat, sys, tempfile, threading, time
 from pathlib import Path
 from urllib.parse import urlsplit
 import httpx
@@ -37,6 +37,7 @@ class DesktopLease:
         if self.home.resolve()!=self.home:raise ValueError('runner_state_symlink_denied')
         self.home.mkdir(parents=True,exist_ok=True,mode=0o700)
         self.lock_path=Path(lock_path or (Path(tempfile.gettempdir())/f'carme-desktop-{os.getuid()}.lock'))
+        self.helper_pid=0;self.computer_busy=False
         self.fd=None;self.run='';self.generation='';self.guard=threading.RLock();self.revoked=True
     def release(self):
         with self.guard:
@@ -179,7 +180,7 @@ def listen_human(lease,ready,stopped):
     def event(proxy,kind,value,info):
         if kind in (q.kCGEventTapDisabledByTimeout,q.kCGEventTapDisabledByUserInput):
             lease.takeover('input_monitor_unavailable');stopped.set()
-        elif (lease.run or lease.grant()) and q.CGEventGetIntegerValueField(value,q.kCGEventSourceUnixProcessID)!=os.getpid():
+        elif (lease.computer_busy if lease.grant().get('mode') == 'computer_use' else bool(lease.run or lease.grant())) and q.CGEventGetIntegerValueField(value,q.kCGEventSourceUnixProcessID) not in {os.getpid(), lease.helper_pid}:
             # Do not record key values, coordinates, clipboard or window content.
             lease.takeover()
         return value
@@ -190,6 +191,154 @@ def listen_human(lease,ready,stopped):
     try:
         while not stopped.is_set():q.CFRunLoopRunInMode(q.kCFRunLoopDefaultMode,.05,False)
     finally:q.CGEventTapEnable(tap,False);q.CFRunLoopRemoveSource(loop,source,q.kCFRunLoopCommonModes);lease.takeover('runner_stopped')
+
+def host_computer_settings(config):
+    if config.get('account_id') != 'main': raise ValueError('main_host_computer_only')
+    settings = config.get('computer_use') or {}
+    for field in ('toolchain', 'node', 'helper_app'):
+        path = Path(settings.get(field, ''))
+        if not path.is_absolute() or path.resolve() != path or not path.exists(): raise ValueError('host_computer_installation_missing')
+    package = Path(settings['toolchain']) / 'node_modules/@injaneity/pi-computer-use/package.json'
+    if json.loads(package.read_text()).get('version') != '0.5.1': raise ValueError('host_computer_version_mismatch')
+    binary = Path(settings['helper_app']) / 'Contents/MacOS/bridge'
+    if hashlib.sha256(binary.read_bytes()).hexdigest() != settings.get('helper_sha256'):
+        raise ValueError('host_computer_helper_changed')
+    return settings
+
+
+def helper_process(socket_path, executable):
+    # LaunchServices owns the app process. Identify only our unique socket instance.
+    output = subprocess.run(['/bin/ps', '-axo', 'pid=,command='], capture_output=True, text=True, timeout=3).stdout
+    wanted = str(executable) + ' serve --socket ' + str(socket_path)
+    matches = [int(line.strip().split(None, 1)[0]) for line in output.splitlines()
+               if len(line.strip().split(None, 1)) == 2 and line.strip().split(None, 1)[1] == wanted]
+    if len(matches) > 1: raise RuntimeError('host_helper_identity_conflict')
+    return matches[0] if matches else 0
+
+
+async def close_host_computer(state, lease):
+    node = state.pop('node', None)
+    if node and node.returncode is None:
+        node.terminate()
+        try: await asyncio.wait_for(node.wait(), 2)
+        except asyncio.TimeoutError: node.kill(); await node.wait()
+    socket_path = state.get('socket'); executable = state.get('executable')
+    if socket_path and executable:
+        pid = helper_process(socket_path, executable)
+        if pid:
+            os.kill(pid, signal.SIGTERM)
+            for _ in range(20):
+                if helper_process(socket_path, executable) != pid: break
+                await asyncio.sleep(.1)
+            else:
+                if helper_process(socket_path, executable) == pid: os.kill(pid, signal.SIGKILL)
+        Path(socket_path).unlink(missing_ok=True)
+    lease.helper_pid = 0; lease.computer_busy = False
+    state.clear()
+
+
+async def request_host_permissions(config):
+    settings = host_computer_settings(config)
+    root = Path(tempfile.mkdtemp(prefix='carme-host-permissions-')).resolve()
+    socket_path = root/'bridge.sock'; executable = Path(settings['helper_app'])/'Contents/MacOS/bridge'
+    state = {'socket':socket_path, 'executable':executable}
+    lease = DesktopLease(config['state_dir'])
+    try:
+        child=await asyncio.create_subprocess_exec('/usr/bin/open','-n','-g',settings['helper_app'],'--args','serve','--socket',str(socket_path),
+            stdout=asyncio.subprocess.DEVNULL,stderr=asyncio.subprocess.DEVNULL)
+        if await child.wait():raise RuntimeError('host_helper_launch_failed')
+        for _ in range(60):
+            if socket_path.exists() and helper_process(socket_path,executable):break
+            await asyncio.sleep(.1)
+        else:raise RuntimeError('host_helper_start_timeout')
+        reader,writer=await asyncio.open_unix_connection(str(socket_path),limit=1024*1024)
+        try:
+            writer.write((json.dumps({'id':secrets.token_hex(16),'cmd':'registerPermissions'})+'\n').encode());await writer.drain()
+            result=json.loads(await asyncio.wait_for(reader.readline(),25))
+            if result.get('ok') is not True:raise RuntimeError('host_helper_permission_request_failed')
+        finally:writer.close();await writer.wait_closed()
+        return {'requested':True,'helper_app':settings['helper_app']}
+    finally:
+        await close_host_computer(state,lease)
+        with contextlib.suppress(OSError):root.rmdir()
+
+
+async def host_computer_operation(config, state, lease, desktop, request):
+    from .docker_desktop import UI_TOOLS, validate
+    op, args = request['operation'], validate(request['operation'], request['arguments'])
+    def permitted():
+        grant = lease.grant()
+        if (grant.get('mode') != 'computer_use' or grant.get('bot_id') not in {'*', request['bot_id']}
+                or 'host:' + grant.get('generation', '') != request['target'] or time.time() >= request['deadline']):
+            raise RuntimeError('host_computer_grant_revoked')
+    permitted()
+    with lease.guard:
+        if lease.fd is None:
+            fd=os.open(lease.lock_path,os.O_CREAT|os.O_RDWR|os.O_NOFOLLOW,0o600)
+            try: fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
+            except BaseException: os.close(fd);raise RuntimeError('physical_desktop_busy')
+            lease.fd=fd
+        lease.run='computer:'+request['bot_id'];lease.generation=lease.grant()['generation'];lease.revoked=False
+    if op == 'status':
+        value = await asyncio.to_thread(desktop.status); value.update(mode='host', platform='darwin'); return value
+    if op == 'screenshot':
+        raw = await asyncio.to_thread(desktop.screenshot); permitted()
+        return {'body': base64.b64encode(raw).decode(), 'mime': 'image/jpeg', 'at': time.time()}
+    if op == 'release':
+        await asyncio.to_thread(desktop.set_control, False); return {'ok': True}
+    if op in {'mouse', 'keyboard'}:
+        await asyncio.to_thread(desktop.set_control, True); permitted()
+        if op == 'mouse': return await asyncio.to_thread(desktop.mouse, **args)
+        if args.get('text'):
+            def type_text():
+                import Quartz as q
+                for character in args['text']:
+                    permitted()
+                    for down in (True, False):
+                        event = q.CGEventCreateKeyboardEvent(None, 0, down)
+                        if event is None: raise RuntimeError('host_keyboard_permission_required')
+                        q.CGEventKeyboardSetUnicodeString(event, len(character.encode('utf-16-le')) // 2, character)
+                        q.CGEventPost(q.kCGHIDEventTap, event)
+            await asyncio.to_thread(type_text); return {'ok': True}
+        return await asyncio.to_thread(desktop.keyboard, keys=args['keys'])
+    if op not in UI_TOOLS | {'help'}: raise ValueError('host_computer_ui_tools_only')
+    settings = host_computer_settings(config)
+    if state.get('generation') != request['target'] or not state.get('node') or state['node'].returncode is not None:
+        await close_host_computer(state, lease)
+        lease.computer_busy = True
+        root = Path(tempfile.gettempdir()).resolve() / ('carme-host-' + hashlib.sha256(config['runner_id'].encode()).hexdigest()[:16])
+        if root.is_symlink(): raise ValueError('host_socket_root_denied')
+        root.mkdir(mode=0o700, exist_ok=True); root.chmod(0o700)
+        socket_path = root / 'bridge.sock'; executable = Path(settings['helper_app']) / 'Contents/MacOS/bridge'
+        if socket_path.exists(): raise RuntimeError('host_helper_socket_already_in_use')
+        state.update(socket=socket_path, executable=executable, generation=request['target'])
+        child = await asyncio.create_subprocess_exec('/usr/bin/open', '-n', '-g', settings['helper_app'], '--args', 'serve', '--socket', str(socket_path),
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+        if await child.wait(): raise RuntimeError('host_helper_launch_failed')
+        for _ in range(60):
+            permitted(); pid = helper_process(socket_path, executable)
+            if socket_path.exists() and pid: break
+            await asyncio.sleep(.1)
+        else: raise RuntimeError('host_helper_start_timeout')
+        lease.helper_pid = pid
+        # A private daemon/socket and explicit extension; no personal Pi settings,
+        # model credentials or extensions are imported into this GUI bridge.
+        work = Path(config['state_dir']) / 'computer'; work.mkdir(mode=0o700, exist_ok=True)
+        env = {'HOME': str(work), 'PATH': '/usr/bin:/bin:/usr/sbin:/sbin', 'LANG': 'en_US.UTF-8',
+            'PI_CODING_AGENT_DIR': str(work / 'pi'), 'CARME_COMPUTER_CWD': str(work),
+            'PI_CU_SOCKET_PATH': str(socket_path), 'PI_COMPUTER_USE_HELPER_APP_PATH': settings['helper_app'],
+            'PI_COMPUTER_USE_HEADLESS': 'false', 'PI_COMPUTER_USE_BROWSER_USE': 'false', 'PI_COMPUTER_USE_CURSOR_OVERLAY': 'false'}
+        package = Path(settings['toolchain'])
+        state['node'] = await asyncio.create_subprocess_exec(settings['node'], '--import', str(package/'node_modules/tsx/dist/loader.mjs'), str(package/'computer-use.ts'),
+            cwd=work, env=env, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL, limit=16*1024*1024)
+    permitted(); node = state['node']; identity = secrets.token_hex(16)
+    node.stdin.write((json.dumps({'id':identity, 'name':op, 'arguments':args})+'\n').encode()); await node.stdin.drain()
+    result = json.loads(await asyncio.wait_for(node.stdout.readline(), 65))
+    permitted()
+    if result.get('id') != identity: raise RuntimeError('host_computer_protocol_mismatch')
+    if result.get('error'): raise RuntimeError(result['error'])
+    return result['result']
+
 
 async def serve(config):
     state=permissions()
@@ -212,6 +361,7 @@ async def serve(config):
             r.raise_for_status()
             if len(r.content)>16_000_000 or not hmac.compare_digest(signature(key,nonce,r.content),r.headers.get('X-Carme-Signature','')):raise ValueError('control_signature_invalid')
             return r.json()
+        host_state = {}
         screen_size=(0,0)
         try:
             desktop=DesktopController({'enabled':True,'control_enabled':True})
@@ -229,7 +379,32 @@ async def serve(config):
                 grant=lease.grant()
                 if not grant or (lease.generation and lease.generation!=grant['generation']):lease.release()
                 try:
-                    answer=await call({'op':'claim','runner_id':config['runner_id'],'authorized':bool(lease.grant())})
+                    if config.get('computer_use'):
+                        current = lease.grant()
+                        host_grant = {k: current[k] for k in ('bot_id', 'generation', 'expires')} if current.get('mode') == 'computer_use' else {}
+                        request = await call({'op':'computer_claim', 'runner_id':config['runner_id'], 'grant':host_grant})
+                        if not host_grant and host_state:
+                            await close_host_computer(host_state, lease)
+                            if desktop: await asyncio.to_thread(desktop.set_control, False)
+                        if request:
+                            if desktop is None: raise RuntimeError('host_desktop_permissions_required')
+                            lease.computer_busy = True
+                            operation = asyncio.create_task(host_computer_operation(config, host_state, lease, desktop, request))
+                            try:
+                                while not operation.done():
+                                    await asyncio.wait({operation}, timeout=.2)
+                                    permit = await call({'op':'computer_check', 'runner_id':config['runner_id'], 'id':request['id']})
+                                    if (not permit.get('active') or lease.grant().get('generation') != host_grant.get('generation')):
+                                        raise RuntimeError('host_computer_grant_revoked')
+                                result = operation.result()
+                            except BaseException as exc:
+                                operation.cancel(); await asyncio.gather(operation, return_exceptions=True)
+                                await close_host_computer(host_state, lease)
+                                result = {'error':str(exc)[:1200]}
+                            finally: lease.computer_busy = False
+                            await call({'op':'computer_finish', 'runner_id':config['runner_id'], 'id':request['id'], 'result':result})
+                        save(lease.home/'status.json', {'state':'ready', 'at':time.time(), 'computer_use':True, 'authorized':bool(host_grant)})
+                    answer=await call({'op':'claim','runner_id':config['runner_id'],'authorized':bool(lease.grant()) and lease.grant().get('mode') != 'computer_use'})
                     if answer.get('screen') and desktop is not None:
                         try:
                             frame=await asyncio.to_thread(desktop.screenshot)
@@ -260,24 +435,38 @@ async def serve(config):
                         await call({'op':'finish','runner_id':config['runner_id'],'job_id':job['job_id'],'lease':answer['lease'],'result':result})
                 except Exception:
                     lease.takeover('control_disconnected_no_replay')
+                    await close_host_computer(host_state, lease)
                 await asyncio.sleep(.2)
-        finally:stopped.set();lease.takeover('runner_stopped');listener.join(timeout=2)
+        finally:
+            if config.get('computer_use'):
+                with contextlib.suppress(Exception): await call({'op':'computer_claim','runner_id':config['runner_id'],'grant':{}})
+            stopped.set(); lease.takeover('runner_stopped'); listener.join(timeout=2)
+            await close_host_computer(host_state, lease)
+            if desktop: desktop.close()
 
 def main():
-    p=argparse.ArgumentParser(description=__doc__);p.add_argument('op',choices=['doctor','request','serve','grant','stop','status']);p.add_argument('--config',type=Path,required=True)
+    p=argparse.ArgumentParser(description=__doc__);p.add_argument('op',choices=['doctor','request','serve','grant','revoke','stop','status']);p.add_argument('--config',type=Path,required=True)
+    p.add_argument('--computer-use',action='store_true')
     p.add_argument('--allow-gui',action='store_true');p.add_argument('--bot');p.add_argument('--bundle');p.add_argument('--window',type=int);p.add_argument('--seconds',type=int,default=60)
     a=p.parse_args();c=json.loads(a.config.read_text());home=Path(c['state_dir'])
     if a.op=='doctor':print(json.dumps(permissions()));return
-    if a.op=='request':print(json.dumps(request_permissions()));return
+    if a.op=='request':
+        print(json.dumps(asyncio.run(request_host_permissions(c)) if a.computer_use else request_permissions()));return
     if a.op=='serve':
         if not a.allow_gui:p.error('serve 需要显式 --allow-gui；请先阅读本机权限与接管说明')
         (home/'stop').unlink(missing_ok=True);asyncio.run(serve(c))
     elif a.op=='grant':
         bot=(a.bot or '*').strip()
-        if not a.allow_gui or not bot or not a.bundle or not a.window or not 1<=a.seconds<=600:p.error('grant 需要 --allow-gui --bundle --window 和 1–600 秒期限；--bot 省略或 * 表示全部 Bot')
+        if not a.allow_gui or not bot or (not a.computer_use and (not a.bundle or not a.window)) or not 1<=a.seconds<=600:p.error('grant 需要 --allow-gui --bundle --window 和 1–600 秒期限；--bot 省略或 * 表示全部 Bot')
         if bot!='*' and not re.fullmatch(r'[A-Za-z0-9_-]{1,64}',bot):p.error('bot 格式不正确')
+        if a.computer_use:
+            host_computer_settings(c)
+            save(home/'grant.json',{'mode':'computer_use','bot_id':bot,'expires':time.time()+a.seconds,'generation':secrets.token_hex(16)})
+            print('已授权 main 的宿主电脑；到期、撤销或执行中的人工接管会停止操作。');return
         save(home/'grant.json',{'bot_id':bot,'bundle_id':a.bundle,'window_id':a.window,'expires':time.time()+a.seconds,'generation':secrets.token_hex(16)})
         print('已授权'+('全部 Bot' if bot=='*' else ' Bot '+bot)+'/指定窗口；每个动作仍需 Control 审批；人工操作或停止将撤销。')
+    elif a.op=='revoke':
+        (home/'grant.json').unlink(missing_ok=True);print('已撤销宿主电脑授权。')
     elif a.op=='stop':
         save(home/'stop',{'stop':True});(home/'grant.json').unlink(missing_ok=True);print('已请求停止并撤销本地授权。')
     else:

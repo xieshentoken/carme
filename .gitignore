@@ -4,15 +4,27 @@
 /admin/
 /exports/
 
-# 内部设计 / 审查文档与本机 AI 工具状态
+# 内部设计 / 审查文档、施工过程文档与本机 AI 工具状态
 /docs/
 /.pi/
+/AGENTS.md
+/STATUS.md
+/PLAN.md
+/DECISIONS.md
+/SPEC.md
 
 # 个人配置（模型、Bot、语音、沙箱与浏览器资料）与凭据
 /app/config/
 /app/.env
 /app/.local/
 
-# 系统
+# 实例专属的一次性迁移脚本（内含该实例真实的 Bot ID 花名册，不入库）
+/app/scripts/prepare_main_group_roster.py
+
+# 生成物：源码导航索引、构建产物与缓存
+/.graphifyignore
+graphify-out/
+__pycache__/
+*.py[cod]
 .DS_Store
 *.log

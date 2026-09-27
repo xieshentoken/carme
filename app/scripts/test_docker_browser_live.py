@@ -3,7 +3,7 @@
 HTML responses at fixture.invalid are synthetic; public example.com and denied
 destinations use the real production HTTP relay. No personal browser/profile.
 """
-import asyncio, base64, copy, hashlib, json, os, secrets, sys, time
+import asyncio, base64, copy, hashlib, json, os, secrets, sys, tempfile, time
 from pathlib import Path
 from unittest.mock import patch
 import httpx
@@ -17,7 +17,7 @@ from carme.execution import build_execution_router
 from carme.tools.base import ToolContext
 
 params = json.loads(Path(sys.argv[1]).read_text())
-work = Path(params['work']).resolve();assert str(work).startswith('/private/tmp/carme-browser-')
+work = Path(params['work']).resolve();assert str(work).startswith(tempfile.gettempdir()+'/carme-browser-')
 out = Path(params['evidence']);out.mkdir(parents=True, exist_ok=True)
 checks, captures, inspected = [], [], []
 def record(name, **details):

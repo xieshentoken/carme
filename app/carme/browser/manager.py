@@ -122,7 +122,7 @@ class BrowserManager:
 
     async def _get_session(self, profile: str, *, headless: bool | None = None,
                            node: dict | None = None) -> BrowserSession:
-        if getattr(self, 'execution', None) and self.execution.runtime.config.isolation.get('browser'):
+        if getattr(self, 'execution', None) and (self.execution.runtime.config.isolation.get('desktop') or self.execution.runtime.config.isolation.get('browser')):
             raise BrowserError('docker_browser_task_required: Control 不启动本机或 SSH 浏览器')
         key = self._session_key(profile, node)
         session = self._sessions.get(key)
@@ -287,11 +287,12 @@ class BrowserManager:
         return removed
 
     async def probe(self, *, node: dict | None = None) -> dict:
-        if getattr(self, 'execution', None) and self.execution.runtime.config.isolation.get('browser'):
+        if getattr(self, 'execution', None) and (self.execution.runtime.config.isolation.get('desktop') or self.execution.runtime.config.isolation.get('browser')):
             health = self.execution.health()
-            return {'ok': self.enabled and health['browser'] == 'ready', 'execution': 'docker-browser',
+            desktop = bool(self.execution.runtime.config.isolation.get('desktop'))
+            return {'ok': self.enabled and health['browser'] == 'ready', 'execution': 'bot-desktop' if desktop else 'docker-browser',
                     'status': health['browser'], 'profiles': ['account/Bot/profile'],
-                    'host_fallback': False, 'manual_login': 'QR screenshot; interactive window unavailable'}
+                    'host_fallback': False, 'manual_login': 'Bot desktop external control' if desktop else 'QR screenshot; interactive window unavailable'}
         if not self.enabled:
             return {"ok": False, "error": "浏览器代操作在 config/browser.yaml 里被关掉了（enabled: false）"}
         try:

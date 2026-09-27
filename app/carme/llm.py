@@ -245,6 +245,7 @@ class LLMGateway:
         cli_tool_event=None,
         runtime_profile: str = "",
         cli_runner=None,
+        cli_native_session: bool = False,
     ) -> LLMResponse:
         """按档位或指定模型调用；CLI 使用任务固定工作目录和可选 Carme 桥接。"""
         if engine != "api":
@@ -255,6 +256,7 @@ class LLMGateway:
                 on_tool_event=cli_tool_event,
                 runtime_profile=runtime_profile,
                 runner=cli_runner,
+                native_session=cli_native_session,
             )
 
         # API 网关按档位（或指定模型）调用，失败自动降级到下一个候选。
@@ -684,7 +686,8 @@ class LLMGateway:
     async def _cli_chat(self, engine: str, engine_model: str, messages: list[dict], *,
                         system_extra: str, effort: str, tools: list[dict] | None = None,
                         tool_execute=None, workspace_dir: str = "", max_tool_calls: int = 32,
-                        on_stream=None, on_tool_event=None, runtime_profile: str = "", runner=None) -> LLMResponse:
+                        on_stream=None, on_tool_event=None, runtime_profile: str = "", runner=None,
+                        native_session: bool = False) -> LLMResponse:
         last_payload: dict = {}
 
         async def relay(payload: dict) -> None:
@@ -700,13 +703,14 @@ class LLMGateway:
                 profile = same[0]  # 未绑定档案的 Bot 自动跟随唯一的已登记档案；重新登记后无需逐个重绑
         try:
             result = await run_cli_engine(
-                engine, format_prompt(messages, system_extra, has_tool_bridge=bool(tools),
-                                      workspace_dir=workspace_dir),
+                engine, '' if native_session else format_prompt(messages, system_extra, has_tool_bridge=bool(tools),
+                                                               workspace_dir=workspace_dir),
                 model=engine_model, effort=effort, workspace_dir=workspace_dir,
                 tool_specs=tools, tool_execute=tool_execute, max_tool_calls=max_tool_calls,
                 on_stream=relay if on_stream else None, on_tool_event=on_tool_event,
                 profile=profile,
                 runner=runner,
+                **({'messages': messages, 'system_prompt': system_extra} if native_session else {}),
             )
         except CliEngineError as exc:
             raise LLMError(str(exc)) from None
@@ -717,8 +721,9 @@ class LLMGateway:
             call=result.yielded_tool
             response.tool_calls=[ToolCall(id=call['id'],name=call['name'],arguments=call['arguments'])]
             response.streamed=False
-        if on_stream:
-            payload = {**last_payload, "content": result.text, "model": response.model,
+        if on_stream and result.text:
+            payload = {**last_payload, "message_id": last_payload.get('message_id') or 'm_' + uuid.uuid4().hex,
+                       "content": result.text, "model": response.model,
                        "provider": engine, "status": "done"}
             await on_stream(payload)
         return response

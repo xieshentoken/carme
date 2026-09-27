@@ -364,7 +364,7 @@ class DesktopController:
 
     # macOS ANSI 虚拟键码（kVK_*）
     _VK: dict[str, int] = {
-        "return": 36, "enter": 36, "tab": 48, "space": 49, "delete": 51, "backspace": 51,
+        "return": 36, "enter": 36, "tab": 48, "space": 49, "delete": 51, "backspace": 51, "forwarddelete": 117,
         "escape": 53, "esc": 53, "home": 115, "end": 119, "pageup": 116, "pagedown": 121,
         "up": 126, "down": 125, "left": 123, "right": 124,
         "f1": 122, "f2": 120, "f3": 99, "f4": 118, "f5": 96, "f6": 97, "f7": 98,

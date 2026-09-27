@@ -104,6 +104,19 @@ async def main():
             if detail['task']['status'] in {'done','failed','cancelled'}:return detail
             await asyncio.sleep(.2)
         raise AssertionError('task deadline '+tid)
+    async def pi_delegation():
+        # Genuine Pi parent releases its container before the Pi child starts at capacity one.
+        plan['M4PiParent']=[['delegate',{'agent':'child','goal':'在容器写入子任务证明。'}]]
+        plan['M4PiChild']=[['write_file',{'path':'/out/child.txt','content':'PI_CHILD_AT_CAPACITY_ONE'}]];update_plan()
+        pc=await conversation('parent');pid=await send(pc,'parent','委派 child 完成证明后总结。');pi=await settle(pid)
+        assert pi['task']['status']=='done' and len(pi['children'])==1 and pi['children'][0]['status']=='done',pi
+        record('CO04_actual_pi_parent_yield_child_capacity_one',{'task':pid,'child':pi['children'][0]['id'],'max_observed':{k:max(c[k] for c in COUNTS) for k in ('pi','action')}})
+    if PARAMS.get('native_delegate_only'):
+        await pi_delegation()
+        (OUT/'inspect.json').write_text(json.dumps(f['INSPECTED'],indent=2))
+        (OUT/'capacity.json').write_text(json.dumps(COUNTS))
+        await client.aclose()
+        return
     async def verify_accept(tid):
         result=await request('POST',f'/tasks/{tid}/verify');assert result['status']=='verified',result
         await request('POST',f'/tasks/{tid}/accept',{'report_hash':result['report_hash']});return result
@@ -185,12 +198,7 @@ print('ACTUAL_GENERATION',value)
     for revision in (v2,rev):await request('POST','/skill-grants',{'bot_id':'learner','skill_id':sid,'revision':revision})
     assert (await request('GET','/learning'))['skill_grants']['learner'][sid]==rev
     record('SK05_bot_fixed_version_update_and_rollback',{'v1':rev,'v2':v2})
-    # Genuine Pi parent releases its container before the Pi child starts at capacity one.
-    plan['M4PiParent']=[['delegate',{'agent':'child','goal':'在容器写入子任务证明。'}]]
-    plan['M4PiChild']=[['write_file',{'path':'/out/child.txt','content':'PI_CHILD_AT_CAPACITY_ONE'}]];update_plan()
-    pc=await conversation('parent');pid=await send(pc,'parent','委派 child 完成证明后总结。');pi=await settle(pid)
-    assert pi['task']['status']=='done' and len(pi['children'])==1 and pi['children'][0]['status']=='done',pi
-    record('CO04_actual_pi_parent_yield_child_capacity_one',{'task':pid,'child':pi['children'][0]['id'],'max_observed':{k:max(c[k] for c in COUNTS) for k in ('pi','action')}})
+    await pi_delegation()
     # Third-party stdio lives in Action. Catalog pagination >200, precise per-Bot grants.
     mcp_source='''import json,sys,time,os
 from pathlib import Path
@@ -278,7 +286,8 @@ for line in sys.stdin:
         assert login.status==200,await login.text()
         page=await context.new_page();page_errors=[];page.on('pageerror',lambda error:page_errors.append(str(error)))
         await page.goto(broker['control_url'],wait_until='domcontentloaded')
-        await page.get_by_role('button',name='探索 Bot',exact=True).click()
+        await page.get_by_role('button',name='搜索',exact=True).click()
+        await page.get_by_role('option',name='插件').click()
         await page.get_by_role('tab',name='已安装的 Skill',exact=True).click()
         await page.get_by_text('版本授权与 Skill 学习',exact=True).click()
         await page.get_by_label('候选',exact=True).select_option(candidate['id'])
